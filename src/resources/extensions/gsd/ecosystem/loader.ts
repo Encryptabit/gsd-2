@@ -17,6 +17,20 @@ import {
   type GSDExtensionAPI,
 } from "./gsd-extension-api.js";
 
+// Matches the pi-coding-agent loader's timing convention so operators can
+// enable both with one env var (`GSD_STARTUP_TIMING=1` or `PI_TIMING=1`).
+const EXTENSION_TIMING_ENABLED =
+  process.env.GSD_STARTUP_TIMING === "1" || process.env.PI_TIMING === "1";
+
+function logEcosystemTiming(
+  extensionPath: string,
+  ms: number,
+  outcome: "loaded" | "failed",
+): void {
+  if (!EXTENSION_TIMING_ENABLED) return;
+  console.error(`[startup] ecosystem extension ${outcome}: ${extensionPath} (${ms}ms)`);
+}
+
 // ─── Trust check (inlined; pi does not export isProjectTrusted from its
 // package root, and constraint forbids modifying packages/pi-coding-agent/) ─
 
@@ -110,7 +124,7 @@ async function _loadEcosystemExtensionsImpl(
   try {
     entries = fs
       .readdirSync(extDir)
-      .filter((f) => f.endsWith(".js") || f.endsWith(".ts"))
+      .filter((f) => f.endsWith(".js") || f.endsWith(".mjs") || f.endsWith(".ts"))
       .sort(); // deterministic load order
   } catch (err) {
     logWarning(
@@ -136,66 +150,72 @@ async function _loadOne(
   api: GSDExtensionAPI,
 ): Promise<void> {
   const fullPath = path.join(extDir, entry);
-
-  // Symlink-escape guard: reject entries whose realpath is not under realExtDir.
-  let realFullPath: string;
+  const startedAt = Date.now();
+  let outcome: "loaded" | "failed" = "failed";
   try {
-    realFullPath = fs.realpathSync(fullPath);
-  } catch (err) {
-    logWarning(
-      "ecosystem",
-      `failed to resolve ${entry}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return;
-  }
-  const realExtDirWithSep = realExtDir.endsWith(path.sep) ? realExtDir : realExtDir + path.sep;
-  if (
-    realFullPath !== realExtDir &&
-    !realFullPath.startsWith(realExtDirWithSep)
-  ) {
-    logWarning("ecosystem", `rejecting ${entry}: realpath escapes extensions dir`);
-    return;
-  }
-
-  // For .ts files, require a sibling compiled .js — we do not run a TS loader
-  // in production. Drop mtime heuristics: if .js exists, prefer it; otherwise warn.
-  let importPath = realFullPath;
-  if (entry.endsWith(".ts")) {
-    const jsSibling = realFullPath.slice(0, -3) + ".js";
-    if (fs.existsSync(jsSibling)) {
-      importPath = jsSibling;
-    } else {
+    // Symlink-escape guard: reject entries whose realpath is not under realExtDir.
+    let realFullPath: string;
+    try {
+      realFullPath = fs.realpathSync(fullPath);
+    } catch (err) {
       logWarning(
         "ecosystem",
-        `${entry}: TypeScript source has no compiled .js sibling — compile it first`,
+        `failed to resolve ${entry}: ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
-  }
+    const realExtDirWithSep = realExtDir.endsWith(path.sep) ? realExtDir : realExtDir + path.sep;
+    if (
+      realFullPath !== realExtDir &&
+      !realFullPath.startsWith(realExtDirWithSep)
+    ) {
+      logWarning("ecosystem", `rejecting ${entry}: realpath escapes extensions dir`);
+      return;
+    }
 
-  let mod: any;
-  try {
-    mod = await import(pathToFileURL(importPath).href);
-  } catch (err) {
-    logWarning(
-      "ecosystem",
-      `failed to import ${entry}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return;
-  }
+    // For .ts files, require a sibling compiled .js — we do not run a TS loader
+    // in production. Drop mtime heuristics: if .js exists, prefer it; otherwise warn.
+    let importPath = realFullPath;
+    if (entry.endsWith(".ts")) {
+      const jsSibling = realFullPath.slice(0, -3) + ".js";
+      if (fs.existsSync(jsSibling)) {
+        importPath = jsSibling;
+      } else {
+        logWarning(
+          "ecosystem",
+          `${entry}: TypeScript source has no compiled .js sibling — compile it first`,
+        );
+        return;
+      }
+    }
 
-  const factory = mod?.default;
-  if (typeof factory !== "function") {
-    logWarning("ecosystem", `${entry}: default export is not a function`);
-    return;
-  }
+    let mod: any;
+    try {
+      mod = await import(pathToFileURL(importPath).href);
+    } catch (err) {
+      logWarning(
+        "ecosystem",
+        `failed to import ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
 
-  try {
-    await factory(api);
-  } catch (err) {
-    logWarning(
-      "ecosystem",
-      `factory threw for ${entry}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    const factory = mod?.default;
+    if (typeof factory !== "function") {
+      logWarning("ecosystem", `${entry}: default export is not a function`);
+      return;
+    }
+
+    try {
+      await factory(api);
+      outcome = "loaded";
+    } catch (err) {
+      logWarning(
+        "ecosystem",
+        `factory threw for ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  } finally {
+    logEcosystemTiming(fullPath, Date.now() - startedAt, outcome);
   }
 }

@@ -9,7 +9,16 @@ import { describe, it, mock } from "node:test";
 import type { AgentMessage } from "@gsd/pi-agent-core";
 import type { Model, AssistantMessage } from "@gsd/pi-ai";
 
-import { generateSummary, estimateTokens, chunkMessages, isDegenerateSummary, CompactionProducedNoSummaryError } from "./compaction.js";
+import type { SessionEntry } from "../session-manager.js";
+import {
+	CompactionProducedNoSummaryError,
+	chunkMessages,
+	estimateTokens,
+	generateSummary,
+	isDegenerateSummary,
+	prepareCompaction,
+	shouldCompact,
+} from "./compaction.js";
 import { estimateSerializedTokens } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -361,6 +370,176 @@ describe("(#4665) degenerate summary guard", () => {
 		);
 	});
 
+	// -------------------------------------------------------------------------
+	// Follow-up: substring list must catch phrasings observed in the wild
+	// after the initial #4665 fix landed. See user report dated 2026-04-23.
+	// -------------------------------------------------------------------------
+
+	it("isDegenerateSummary detects 'no conversation content' phrasing", () => {
+		assert.equal(
+			isDegenerateSummary(
+				"(No conversation content was provided to summarize.) This output should be flagged because the conversation chunk was empty and this phrase is a reliable signal.",
+			),
+			true,
+			"'no conversation content' must flag — observed phrase from 2026-04-23 report",
+		);
+	});
+
+	it("isDegenerateSummary detects 'no conversation history' phrasing", () => {
+		assert.equal(
+			isDegenerateSummary(
+				"No conversation history was included between the delimiters — this summary is a template shell and carries no real information about the session.",
+			),
+			true,
+			"'no conversation history' must flag — observed phrase from 2026-04-23 report",
+		);
+	});
+
+	it("isDegenerateSummary detects 'nothing to summarize' phrasing", () => {
+		assert.equal(
+			isDegenerateSummary(
+				"## Blocked\n- The provided conversation was truncated in a way that leaves nothing to summarize, so this section cannot be filled in meaningfully.",
+			),
+			true,
+			"'nothing to summarize' must flag — observed phrase from 2026-04-23 report",
+		);
+	});
+
+	it("isDegenerateSummary detects '<conversation> tags/block' prompt-scaffolding leakage", () => {
+		assert.equal(
+			isDegenerateSummary(
+				"The <conversation> tags in the input were empty, so I have nothing substantive to produce for this summary beyond the template shell itself.",
+			),
+			true,
+			"'<conversation> tags' meta-reference means the LLM is talking about the prompt, not the work",
+		);
+		assert.equal(
+			isDegenerateSummary(
+				"Note: the <conversation> block in the user message carried no user/assistant exchanges, so this summary is a placeholder until a real input is provided.",
+			),
+			true,
+			"'<conversation> block' meta-reference is the same degenerate class",
+		);
+	});
+
+	it("isDegenerateSummary detects the full templated-empty shell from the 2026-04-23 report", () => {
+		// This is the exact shape of the summary that slipped through the original
+		// #4665 fix. The template lands at ~900 chars (clears the length guard) but
+		// every section body is "(none)" or a meta-comment about the missing input.
+		const templatedEmpty = `## Goal
+
+(No conversation content was provided to summarize.)
+
+## Constraints & Preferences
+
+- (none)
+
+## Progress
+
+### Done
+
+- (none)
+
+### In Progress
+
+- (none)
+
+### Blocked
+
+- No conversation history was included between the <conversation> tags, so there is nothing to summarize.
+
+## Key Decisions
+
+- (none)
+
+## Next Steps
+
+1. Re-run the summarization request with the actual conversation content included between the <conversation> tags.
+
+## Critical Context
+
+- The <conversation> block in the user message was empty — no user/assistant exchanges were provided to summarize.`;
+
+		assert.equal(
+			isDegenerateSummary(templatedEmpty),
+			true,
+			"the exact templated-empty output from the user's report must be flagged",
+		);
+	});
+
+	it("isDegenerateSummary structural density guard flags (none)-heavy short shells even without known phrases", () => {
+		// No observed degenerate phrases, but the shell has 5 "(none)" sections
+		// and is short. This is the archetypal empty template.
+		const densityShell = `## Goal
+(none)
+
+## Constraints & Preferences
+- (none)
+
+## Progress
+### Done
+- (none)
+
+### In Progress
+- (none)
+
+### Blocked
+- (none)
+
+## Key Decisions
+- (none)
+
+## Next Steps
+- (none)`;
+
+		assert.equal(
+			isDegenerateSummary(densityShell),
+			true,
+			"shells with ≥3 '(none)' sections under the length threshold must flag via the density guard",
+		);
+	});
+
+	it("isDegenerateSummary does NOT flag real summaries that legitimately have a few (none) sections", () => {
+		// A narrow task may legitimately leave Constraints / Blocked / Critical
+		// Context as "(none)". The populated sections carry real content and push
+		// total length well over 1200 chars — density guard must NOT trip here.
+		const narrowButReal = `## Goal
+Replace the in-memory session store with a SQLite-backed implementation so sessions survive process restarts and can be queried by auxiliary tools.
+
+## Constraints & Preferences
+- (none)
+
+## Progress
+### Done
+- [x] Added better-sqlite3 to the server package and wrote the initial schema migration.
+- [x] Implemented SessionStore.save/load/listByUser backed by prepared statements.
+- [x] Wired the new store into the request handler and removed the in-memory map.
+- [x] Added an integration test that restarts the server mid-session and asserts survival.
+
+### In Progress
+- [ ] Backfill script to migrate any still-in-memory sessions on deploy.
+
+### Blocked
+- (none)
+
+## Key Decisions
+- **better-sqlite3 over node:sqlite**: synchronous API matches the existing handler flow, and the performance delta at our volume is negligible.
+- **One WAL-mode connection, shared across handlers**: avoids the reader/writer contention we hit in an earlier spike with per-request connections.
+
+## Next Steps
+1. Ship the backfill script and deploy to staging.
+2. Monitor WAL checkpoint latency under peak load for one week before rolling to production.
+
+## Critical Context
+- (none)`;
+
+		assert.equal(
+			isDegenerateSummary(narrowButReal),
+			false,
+			"real summaries with 3 (none) sections must not be flagged — density guard requires ≥4 to avoid false positives on narrow tasks",
+		);
+	});
+
 	it("does not propagate a degenerate first-chunk summary forward (no 'preserve nothing' chain)", async () => {
 		// Force the chunked path with uncapped summary messages.
 		const messages: AgentMessage[] = [
@@ -572,5 +751,89 @@ describe("(#4665) degenerate summary guard", () => {
 			previousSummary,
 			"when all chunks degenerate, must fall back to previousSummary rather than return empty string",
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// prepareCompaction / shouldCompact guard tests (empty-input fix)
+// ---------------------------------------------------------------------------
+
+function makeMessageEntry(id: string, message: AgentMessage, parentId: string | null = null): SessionEntry {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: new Date(0).toISOString(),
+		message,
+	} as SessionEntry;
+}
+
+describe("prepareCompaction empty-input guard", () => {
+	it("returns undefined when message history is below keepRecentTokens (nothing to summarize)", () => {
+		// One small user message — findCutPoint walks backwards, never accumulates
+		// keepRecentTokens, so cutIndex stays at the first valid cut point.
+		// Result: messagesToSummarize = [], turnPrefixMessages = [].
+		const entries: SessionEntry[] = [makeMessageEntry("e1", makeUserMessage(50))];
+
+		const preparation = prepareCompaction(entries, {
+			enabled: true,
+			reserveTokens: 16_384,
+			keepRecentTokens: 20_000,
+		});
+
+		assert.equal(
+			preparation,
+			undefined,
+			"must bail before calling generateSummary with an empty conversation",
+		);
+	});
+
+	it("returns a preparation when message history has content older than keepRecentTokens", () => {
+		// Two large user messages — the newest fills the keep window; the older
+		// spills over and becomes messagesToSummarize.
+		const entries: SessionEntry[] = [
+			makeMessageEntry("e1", makeUserMessage(25_000)),
+			makeMessageEntry("e2", makeUserMessage(25_000), "e1"),
+		];
+
+		const preparation = prepareCompaction(entries, {
+			enabled: true,
+			reserveTokens: 16_384,
+			keepRecentTokens: 20_000,
+		});
+
+		assert.ok(preparation, "preparation should exist when there's content older than keepRecentTokens");
+		assert.ok(
+			preparation.messagesToSummarize.length + preparation.turnPrefixMessages.length > 0,
+			"at least one message must be slated for summarization",
+		);
+	});
+});
+
+describe("shouldCompact compactable-content gate", () => {
+	const settings = { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 };
+
+	it("returns false when over the threshold but compactable content is below keepRecentTokens", () => {
+		// Scenario: LLM reports 186k (dominated by system prompt + tool schemas)
+		// but message history is only ~4k tokens. Nothing older than the keep
+		// window exists, so compaction would produce an empty conversation.
+		const result = shouldCompact(186_000, 200_000, settings, 4_000);
+		assert.equal(result, false, "must not fire when compactable content is below keepRecentTokens");
+	});
+
+	it("returns true when over the threshold and compactable content exceeds keepRecentTokens", () => {
+		const result = shouldCompact(186_000, 200_000, settings, 50_000);
+		assert.equal(result, true);
+	});
+
+	it("preserves legacy behavior when compactableTokens is omitted", () => {
+		// Backward compatibility: callers that don't provide compactableTokens
+		// get the original pure-threshold decision.
+		assert.equal(shouldCompact(186_000, 200_000, settings), true);
+		assert.equal(shouldCompact(100_000, 200_000, settings), false);
+	});
+
+	it("returns false when disabled regardless of other parameters", () => {
+		assert.equal(shouldCompact(186_000, 200_000, { ...settings, enabled: false }, 50_000), false);
 	});
 });

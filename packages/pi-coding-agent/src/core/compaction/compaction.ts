@@ -185,10 +185,24 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 
 /**
  * Check if compaction should trigger based on context usage.
+ *
+ * `contextTokens` is the LLM-reported (or estimated) whole-request size — it includes
+ * system prompt and tool schemas. `compactableTokens`, when provided, is the estimated
+ * size of the message history only — the portion `prepareCompaction`/`findCutPoint` can
+ * actually summarize. When message history is smaller than `keepRecentTokens`, there is
+ * nothing older than the recent window to cut, so compaction would prepare an empty
+ * conversation and produce a degenerate summary. In that case we skip triggering.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	compactableTokens?: number,
+): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	if (contextTokens <= contextWindow - settings.reserveTokens) return false;
+	if (compactableTokens !== undefined && compactableTokens <= settings.keepRecentTokens) return false;
+	return true;
 }
 
 // ============================================================================
@@ -540,9 +554,13 @@ export function chunkMessages(messages: AgentMessage[], maxTokensPerChunk: numbe
  * propagates this forward, every subsequent chunk is told to "PRESERVE all
  * existing information" — which preserves the emptiness.
  *
- * Conservative match: an explicit substring hit OR length < 100 chars. We keep
- * this deterministic (no fuzzy scoring) because fuzzy matching is where
- * quality gates become flaky and hard to test.
+ * Three layers of defense, all deterministic (no fuzzy scoring):
+ *   1. Substring hits on observed degenerate phrasings.
+ *   2. Raw length guard (< 100 chars).
+ *   3. Structural density guard: the LLM often returns a fully-populated
+ *      template shell ("## Goal", "## Progress", …) where every body resolves
+ *      to "(none)" or meta-commentary about the missing conversation. The
+ *      shell easily clears 100 chars, but carries no real information.
  *
  * Exported for test access only.
  */
@@ -551,12 +569,39 @@ export function isDegenerateSummary(summary: string | undefined): boolean {
 	// — not degenerate. Empty string IS degenerate: the LLM returned nothing.
 	if (summary === undefined) return false;
 	const lower = summary.toLowerCase();
-	if (lower.includes("empty conversation")) return true;
-	if (lower.includes("no conversation to summarize")) return true;
-	if (lower.includes("no messages to summarize")) return true;
-	// Length guard: any summary shorter than 100 chars is almost certainly
-	// degenerate for a multi-chunk pipeline.
+
+	// Layer 1: known degenerate phrasings. Observed in the wild across multiple
+	// #4665-class incidents.
+	const degeneratePhrases = [
+		"empty conversation",
+		"no conversation to summarize",
+		"no messages to summarize",
+		"no conversation content",
+		"no conversation history",
+		"nothing to summarize",
+		"conversation was empty",
+		"<conversation> tags",
+		"<conversation> block",
+	];
+	for (const phrase of degeneratePhrases) {
+		if (lower.includes(phrase)) return true;
+	}
+
+	// Layer 2: length guard. Any summary shorter than 100 chars is almost
+	// certainly degenerate for a multi-chunk pipeline.
 	if (summary.trim().length < 100) return true;
+
+	// Layer 3: structural density. The SUMMARIZATION_PROMPT template has 7
+	// sections. When the LLM returns a template shell with mostly "(none)"
+	// bodies, substring matches may miss it but the shell is still empty. If
+	// we see ≥4 "(none)" placeholders (≥57% of the 7 sections) AND total
+	// length is under 1200 chars, flag as degenerate. The threshold is 4 and
+	// not 3 because a narrow real task can legitimately leave three sections
+	// as "(none)" (e.g., Constraints, Blocked, Critical Context) while the
+	// other four carry real content.
+	const noneCount = (summary.match(/\(none\)/gi) ?? []).length;
+	if (noneCount >= 4 && summary.trim().length < 1200) return true;
+
 	return false;
 }
 
@@ -810,6 +855,15 @@ export function prepareCompaction(
 	const turnPrefixMessages = cutPoint.isSplitTurn
 		? collectMessages(pathEntries, cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
 		: [];
+
+	// Bail when there is no compactable content. Happens when the LLM-reported context is
+	// dominated by fixed overhead (system prompt, tool schemas) rather than message history,
+	// so `shouldCompact` fires but `findCutPoint` has nothing older than `keepRecentTokens` to cut.
+	// Sending an empty conversation to `generateSummary` yields a degenerate "no content" summary
+	// and wastes a round trip.
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
+		return undefined;
+	}
 
 	// Get previous summary for iterative update
 	let previousSummary: string | undefined;

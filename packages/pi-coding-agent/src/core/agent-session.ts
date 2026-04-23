@@ -127,6 +127,20 @@ export type AgentSessionEvent =
 	| { type: "session_state_changed"; reason: SessionStateChangeReason }
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" }
 	| {
+			/**
+			 * Diagnostic emitted once per auto-compaction attempt after preparation.
+			 * Reveals the split between the LLM-reported whole-request size and the
+			 * actual compactable message history, which diverge when fixed overhead
+			 * (system prompt + tool schemas) dominates context. Issue #4665.
+			 */
+			type: "auto_compaction_diagnostic";
+			reportedTokens: number;
+			messageTokens: number;
+			messagesToSummarizeCount: number;
+			turnPrefixMessagesCount: number;
+			willProceed: boolean;
+	  }
+	| {
 			type: "auto_compaction_end";
 			result: CompactionResult | undefined;
 			aborted: boolean;

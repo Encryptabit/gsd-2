@@ -18,6 +18,7 @@ import {
 	calculateContextTokens,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.js";
@@ -269,9 +270,24 @@ export class CompactionOrchestrator {
 		} else {
 			contextTokens = calculateContextTokens(assistantMessage.usage);
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+
+		// `contextTokens` includes fixed overhead (system prompt, tool schemas) that compaction
+		// cannot reduce. Measure message-body-only tokens so we don't fire on sessions where the
+		// whole-request size is large but there's nothing older than `keepRecentTokens` to cut.
+		const compactableTokens = this._estimateMessageTokens();
+
+		if (shouldCompact(contextTokens, contextWindow, settings, compactableTokens)) {
 			await this._runAutoCompaction("threshold", false);
 		}
+	}
+
+	/** Sum estimateTokens over the live agent message path — message-body content only. */
+	private _estimateMessageTokens(): number {
+		let total = 0;
+		for (const message of this._deps.agent.state.messages) {
+			total += estimateTokens(message);
+		}
+		return total;
 	}
 
 	/** Toggle auto-compaction setting */
@@ -310,6 +326,17 @@ export class CompactionOrchestrator {
 
 			const pathEntries = this._deps.sessionManager.getBranch();
 			const preparation = prepareCompaction(pathEntries, settings);
+
+			const messageTokens = this._estimateMessageTokens();
+			this._deps.emit({
+				type: "auto_compaction_diagnostic",
+				reportedTokens: preparation?.tokensBefore ?? 0,
+				messageTokens,
+				messagesToSummarizeCount: preparation?.messagesToSummarize.length ?? 0,
+				turnPrefixMessagesCount: preparation?.turnPrefixMessages.length ?? 0,
+				willProceed: preparation !== undefined,
+			});
+
 			if (!preparation) {
 				this._deps.emit({ type: "auto_compaction_end", result: undefined, aborted: false, willRetry: false });
 				return;
