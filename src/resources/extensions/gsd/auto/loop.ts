@@ -1,7 +1,7 @@
 /**
  * auto/loop.ts — Main auto-mode execution loop.
  *
- * Iterates: derive → dispatch → guards → runUnit → finalize → repeat.
+ * Iterates: derive → dispatch → guards → runUnit → finalize → before_next_dispatch → repeat.
  * Exits when s.active becomes false or a terminal condition is reached.
  *
  * Imports from: auto/types, auto/resolve, auto/phases
@@ -27,6 +27,7 @@ import {
   runUnitPhase,
   runFinalize,
 } from "./phases.js";
+import { emitBeforeNextDispatch } from "../hook-emitter.js";
 import { debugLog } from "../debug-logger.js";
 import { isInfrastructureError, isTransientCooldownError, getCooldownRetryAfterMs, COOLDOWN_FALLBACK_WAIT_MS, MAX_COOLDOWN_RETRIES } from "./infra-errors.js";
 import { resolveEngine } from "../engine-resolver.js";
@@ -590,6 +591,30 @@ export async function autoLoop(
         break;
       }
       if (finalizeResult.action === "continue") {
+        finishTurn("retry");
+        continue;
+      }
+
+      // ── Phase 6: before_next_dispatch hook ─────────────────────────────
+      const hookResult = await emitBeforeNextDispatch({
+        unitType: iterData.unitType,
+        unitId: iterData.unitId,
+        milestoneId: s.currentMilestoneId ?? undefined,
+        status: "completed",
+        cwd: s.basePath,
+      });
+
+      if (hookResult?.action === "pause") {
+        deps.emitJournalEvent({ ts: new Date().toISOString(), flowId, seq: nextSeq(), eventType: "iteration-end", data: { iteration, hookPause: true, reason: hookResult.reason } });
+        debugLog("autoLoop", { phase: "hook-pause", iteration, reason: hookResult.reason });
+        await deps.pauseAuto(ctx, pi);
+        finishTurn("paused", "none", hookResult.reason ?? "before_next_dispatch: pause");
+        break;
+      }
+
+      if (hookResult?.action === "retry") {
+        deps.emitJournalEvent({ ts: new Date().toISOString(), flowId, seq: nextSeq(), eventType: "iteration-end", data: { iteration, hookRetry: true, reason: hookResult.reason } });
+        debugLog("autoLoop", { phase: "hook-retry", iteration, reason: hookResult.reason });
         finishTurn("retry");
         continue;
       }

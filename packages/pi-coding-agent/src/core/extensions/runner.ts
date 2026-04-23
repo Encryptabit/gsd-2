@@ -19,6 +19,8 @@ import type {
 	BeforeCommitEventResult,
 	BeforeModelSelectEvent,
 	BeforeModelSelectResult,
+	BeforeNextDispatchEvent,
+	BeforeNextDispatchEventResult,
 	BeforePrEvent,
 	BeforePrEventResult,
 	BeforeProviderRequestEvent,
@@ -340,6 +342,14 @@ export class ExtensionRunner {
 				});
 			case "unit_end":
 				return this.emitUnitEnd({
+					unitType: event.unitType,
+					unitId: event.unitId,
+					milestoneId: event.milestoneId,
+					status: event.status,
+					cwd: event.cwd,
+				});
+			case "before_next_dispatch":
+				return this.emitBeforeNextDispatch({
 					unitType: event.unitType,
 					unitId: event.unitId,
 					milestoneId: event.milestoneId,
@@ -1172,6 +1182,26 @@ export class ExtensionRunner {
 			() => ({ type: "unit_end" as const, ...event } satisfies UnitEndEvent),
 			() => ({ done: false }),
 		);
+	}
+
+	async emitBeforeNextDispatch(
+		event: Omit<BeforeNextDispatchEvent, "type">,
+	): Promise<BeforeNextDispatchEventResult | undefined> {
+		let result: BeforeNextDispatchEventResult | undefined;
+		await this.invokeHandlers(
+			"before_next_dispatch",
+			() => ({ type: "before_next_dispatch" as const, ...event } satisfies BeforeNextDispatchEvent),
+			(handlerResult) => {
+				const r = handlerResult as BeforeNextDispatchEventResult | undefined;
+				if (!r) return { done: false };
+				if (r.action === "pause" || r.action === "retry") {
+					result = { action: r.action, reason: r.reason };
+					return { done: true };
+				}
+				return { done: false };
+			},
+		);
+		return result;
 	}
 }
 

@@ -752,6 +752,22 @@ export interface UnitEndEvent {
 	cwd: string;
 }
 
+/** Fired after a unit completes and finalize passes, before the next dispatch. */
+export interface BeforeNextDispatchEvent {
+	type: "before_next_dispatch";
+	unitType: string;
+	unitId: string;
+	milestoneId?: string;
+	status: "completed" | "failed" | "cancelled" | "blocked";
+	cwd: string;
+}
+
+/** Result from before_next_dispatch event handler. */
+export interface BeforeNextDispatchEventResult {
+	action?: "pause" | "continue" | "retry";
+	reason?: string;
+}
+
 /** Fired at the start of each turn */
 export interface TurnStartEvent {
 	type: "turn_start";
@@ -1134,6 +1150,7 @@ export type ExtensionEvent =
 	| MilestoneEndEvent
 	| UnitStartEvent
 	| UnitEndEvent
+	| BeforeNextDispatchEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -1332,6 +1349,7 @@ export interface ExtensionAPI {
 	on(event: "milestone_end", handler: ExtensionHandler<MilestoneEndEvent>): void;
 	on(event: "unit_start", handler: ExtensionHandler<UnitStartEvent>): void;
 	on(event: "unit_end", handler: ExtensionHandler<UnitEndEvent>): void;
+	on(event: "before_next_dispatch", handler: ExtensionHandler<BeforeNextDispatchEvent, BeforeNextDispatchEventResult>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
@@ -1364,7 +1382,8 @@ export interface ExtensionAPI {
 	 * post-plan additions: `notification`, `stop`, `session_end`,
 	 * `before_commit` / `commit`, `before_push` / `push`, `before_pr` /
 	 * `pr_opened`, `before_verify` / `verify_result`, `budget_threshold`,
-	 * `milestone_start` / `milestone_end`, `unit_start` / `unit_end`.
+	 * `milestone_start` / `milestone_end`, `unit_start` / `unit_end`,
+	 * `before_next_dispatch`.
 	 *
 	 * The returned value is the aggregate handler result where meaningful
 	 * (e.g. `{ cancel: true, reason }` from `before_commit`).

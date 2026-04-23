@@ -10,6 +10,7 @@
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 import type {
   BeforeCommitEventResult,
+  BeforeNextDispatchEventResult,
   BeforePrEventResult,
   BeforePushEventResult,
   BeforeVerifyEventResult,
@@ -185,4 +186,18 @@ export async function emitUnitEnd(args: {
 }): Promise<void> {
   if (!_pi) return;
   await _pi.emitExtensionEvent({ type: "unit_end", ...args });
+}
+
+export async function emitBeforeNextDispatch(args: {
+  unitType: string;
+  unitId: string;
+  milestoneId?: string;
+  status: "completed" | "failed" | "cancelled" | "blocked";
+  cwd: string;
+}): Promise<BeforeNextDispatchEventResult | undefined> {
+  if (!_pi) return undefined;
+  return (await _pi.emitExtensionEvent({
+    type: "before_next_dispatch",
+    ...args,
+  })) as BeforeNextDispatchEventResult | undefined;
 }

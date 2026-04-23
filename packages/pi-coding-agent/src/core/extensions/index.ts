@@ -41,6 +41,8 @@ export type {
 	BeforeAgentStartEventResult,
 	BeforeCommitEvent,
 	BeforeCommitEventResult,
+	BeforeNextDispatchEvent,
+	BeforeNextDispatchEventResult,
 	BeforePrEvent,
 	BeforePrEventResult,
 	BeforePushEvent,
