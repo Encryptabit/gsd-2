@@ -34,6 +34,7 @@ export type JournalEventType =
   | "milestone-transition"
   | "stuck-detected"
   | "sidecar-dequeue"
+  | "sidecar-retry-resume"
   | "iteration-end"
   | "worktree-enter"
   | "worktree-create-failed"

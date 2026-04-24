@@ -100,6 +100,7 @@ export function selectReactiveDispatchBatch(
 
 function sidecarToNodeKind(kind: SidecarItem["kind"]): UokGraphNode["kind"] {
   if (kind === "hook") return "hook";
+  if (kind === "retry") return "unit";
   if (kind === "triage") return "verification";
   return "team-worker";
 }

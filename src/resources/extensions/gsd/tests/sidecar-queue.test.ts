@@ -49,13 +49,13 @@ test("SidecarItem type is exported from session.ts", () => {
   );
 });
 
-test("SidecarItem has required kind field with hook/triage/quick-task union", () => {
+test("SidecarItem has required kind field with hook/retry/triage/quick-task union", () => {
   const source = getSessionTsSource();
   const ifaceIdx = source.indexOf("export interface SidecarItem");
   const ifaceBlock = source.slice(ifaceIdx, ifaceIdx + 500);
   assert.ok(
-    ifaceBlock.includes('"hook"') && ifaceBlock.includes('"triage"') && ifaceBlock.includes('"quick-task"'),
-    "SidecarItem.kind must be a union of 'hook' | 'triage' | 'quick-task'",
+    ifaceBlock.includes('"hook"') && ifaceBlock.includes('"retry"') && ifaceBlock.includes('"triage"') && ifaceBlock.includes('"quick-task"'),
+    "SidecarItem.kind must be a union of 'hook' | 'retry' | 'triage' | 'quick-task'",
   );
 });
 

@@ -43,14 +43,16 @@ test("uok execution graph reactive batch honors file conflicts and in-flight wri
 test("uok execution graph sidecar nodes map queue kinds to supported DAG kinds", () => {
   const queue: SidecarItem[] = [
     { kind: "hook", unitType: "execute-task", unitId: "M001/S01/T01", prompt: "hook" },
+    { kind: "retry", unitType: "execute-task", unitId: "M001/S01/T01", prompt: "retry" },
     { kind: "triage", unitType: "triage", unitId: "M001/S01", prompt: "triage" },
     { kind: "quick-task", unitType: "quick-task", unitId: "M001/S01/Q01", prompt: "quick" },
   ];
 
   const nodes = buildSidecarQueueNodes(queue);
   assert.equal(nodes[0]?.kind, "hook");
-  assert.equal(nodes[1]?.kind, "verification");
-  assert.equal(nodes[2]?.kind, "team-worker");
+  assert.equal(nodes[1]?.kind, "unit");
+  assert.equal(nodes[2]?.kind, "verification");
+  assert.equal(nodes[3]?.kind, "team-worker");
   assert.equal(nodes[1]?.dependsOn.length, 1);
 });
 

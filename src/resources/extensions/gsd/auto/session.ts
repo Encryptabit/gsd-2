@@ -51,10 +51,10 @@ export interface PendingVerificationRetry {
 /**
  * A typed item enqueued by postUnitPostVerification for the main loop to
  * drain via the standard runUnit path. Replaces inline dispatch
- * (pi.sendMessage / s.cmdCtx.newSession()) for hooks, triage, and quick-tasks.
+ * (pi.sendMessage / s.cmdCtx.newSession()) for hooks, retries, triage, and quick-tasks.
  */
 export interface SidecarItem {
-  kind: "hook" | "triage" | "quick-task";
+  kind: "hook" | "retry" | "triage" | "quick-task";
   unitType: string;
   unitId: string;
   prompt: string;

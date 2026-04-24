@@ -1,7 +1,7 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 import {
   resolveAgentEnd,
@@ -16,6 +16,7 @@ import {
   type AgentEndEvent,
   type LoopDeps,
 } from "../auto-loop.js";
+import { clearHookEmitter, setHookEmitter } from "../hook-emitter.js";
 import type { SessionLockStatus } from "../session-lock.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1378,6 +1379,74 @@ test("autoLoop drains sidecar queue after postUnitPostVerification enqueues item
     2,
     "postUnitPostVerification should be called twice (main + sidecar)",
   );
+});
+
+test("autoLoop remediates same unit when before_next_dispatch requests retry", async (t) => {
+  _resetPendingResolve();
+  clearHookEmitter();
+  t.after(() => clearHookEmitter());
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+  const basePath = mkdtempSync("/tmp/gsd-hook-retry-");
+  t.after(() => rmSync(basePath, { recursive: true, force: true }));
+  const prompts: string[] = [];
+  pi.sendMessage = (...args: unknown[]) => {
+    const payload = args[0] as { content?: unknown } | undefined;
+    prompts.push(String(payload?.content ?? args[0] ?? ""));
+    pi.calls.push(args);
+  };
+
+  const s = makeLoopSession({ basePath });
+  let hookCallCount = 0;
+  setHookEmitter({
+    emitExtensionEvent: async (event: any) => {
+      if (event?.type !== "before_next_dispatch") return undefined;
+      hookCallCount++;
+      if (hookCallCount === 1) {
+        return {
+          action: "retry",
+          reason: "review-blocked: fix the rejected state before continuing",
+        };
+      }
+      return undefined;
+    },
+  } as any);
+
+  let postVerCallCount = 0;
+  const deps = makeMockDeps({
+    postUnitPostVerification: async () => {
+      postVerCallCount++;
+      deps.callLog.push("postUnitPostVerification");
+      if (postVerCallCount === 2) s.active = false;
+      return "continue" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+
+  await new Promise((r) => setTimeout(r, 50));
+  const retrySidecarsPath = join(basePath, ".gsd", "runtime", "hook-retry-sidecars.json");
+  assert.equal(existsSync(retrySidecarsPath), true, "hook retry sidecar should persist before remediation completes");
+  const retryPayload = JSON.parse(readFileSync(retrySidecarsPath, "utf-8"));
+  assert.equal(retryPayload.queue?.[0]?.unitId, "M001/S01/T01");
+
+  resolveAgentEnd(makeEvent());
+
+  await loopPromise;
+
+  assert.equal(postVerCallCount, 2, "same unit should run once, then run again for remediation");
+  assert.equal(hookCallCount, 2, "review hook should run after the original and remediation passes");
+  assert.equal(prompts.length, 2, "autoLoop should dispatch original prompt and retry remediation prompt");
+  assert.match(prompts[1] ?? "", /REVIEW CHANGES REQUESTED/);
+  assert.match(prompts[1] ?? "", /review-blocked: fix the rejected state before continuing/);
+  assert.match(prompts[1] ?? "", /do the thing/);
+  assert.equal(existsSync(retrySidecarsPath), false, "retry sidecar should clear after remediation completes");
 });
 
 test("autoLoop exits when no active milestone found", async (t) => {

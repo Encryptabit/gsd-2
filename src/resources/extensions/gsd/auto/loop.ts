@@ -37,7 +37,7 @@ import { resolveUokFlags } from "../uok/flags.js";
 import { scheduleSidecarQueue } from "../uok/execution-graph.js";
 import { ExecutionGraphScheduler } from "../uok/execution-graph.js";
 import type { UokGraphNode } from "../uok/contracts.js";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 // ── Stuck detection persistence (#3704) ──────────────────────────────────
@@ -83,6 +83,58 @@ function saveStuckState(basePath: string, state: LoopState): void {
   }
 }
 
+function hookRetrySidecarsPath(basePath: string): string {
+  return join(gsdRoot(basePath), "runtime", "hook-retry-sidecars.json");
+}
+
+function isPersistedRetrySidecar(value: unknown): value is SidecarItem {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<SidecarItem>;
+  return (
+    item.kind === "retry" &&
+    typeof item.unitType === "string" &&
+    typeof item.unitId === "string" &&
+    typeof item.prompt === "string"
+  );
+}
+
+function loadPersistedHookRetrySidecars(basePath: string): SidecarItem[] {
+  try {
+    const payload = JSON.parse(readFileSync(hookRetrySidecarsPath(basePath), "utf-8"));
+    const queue = Array.isArray(payload?.queue) ? payload.queue : [];
+    return queue.filter(isPersistedRetrySidecar);
+  } catch {
+    return [];
+  }
+}
+
+function savePersistedHookRetrySidecars(basePath: string, queue: SidecarItem[]): void {
+  const retries = queue.filter((item) => item.kind === "retry");
+  if (retries.length === 0) {
+    clearPersistedHookRetrySidecars(basePath);
+    return;
+  }
+
+  const filePath = hookRetrySidecarsPath(basePath);
+  mkdirSync(join(gsdRoot(basePath), "runtime"), { recursive: true });
+  writeFileSync(
+    filePath,
+    JSON.stringify({
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      queue: retries,
+    }, null, 2) + "\n",
+  );
+}
+
+function clearPersistedHookRetrySidecars(basePath: string): void {
+  try {
+    unlinkSync(hookRetrySidecarsPath(basePath));
+  } catch {
+    // Missing or already removed is fine.
+  }
+}
+
 // ── Memory pressure monitoring (#3331) ──────────────────────────────────
 // Check heap usage every N iterations and trigger graceful shutdown before
 // the OS OOM killer sends SIGKILL. The threshold is 90% of the V8 heap
@@ -118,6 +170,7 @@ function resolveDispatchNodeKind(
   sidecarItem?: SidecarItem,
 ): UokGraphNode["kind"] {
   if (sidecarItem?.kind === "hook") return "hook";
+  if (sidecarItem?.kind === "retry") return "unit";
   if (sidecarItem?.kind === "triage") return "verification";
   if (sidecarItem?.kind === "quick-task") return "team-worker";
 
@@ -177,6 +230,21 @@ async function runUnitPhaseViaContract(
   ], { parallel: false, maxWorkers: 1 });
 
   return outcome ?? { action: "break", reason: "scheduler-dispatch-missing-result" };
+}
+
+function buildHookRetryPrompt(iterData: IterationData, reason?: string): string {
+  const reviewReason = reason?.trim() || "before_next_dispatch requested a retry.";
+  return [
+    `**REVIEW CHANGES REQUESTED - REMEDIATE ${iterData.unitType} ${iterData.unitId}**`,
+    "",
+    "The post-unit review gate requested changes after this unit completed. Do not move to the next unit yet.",
+    "",
+    reviewReason,
+    "",
+    "---",
+    "",
+    iterData.prompt,
+  ].join("\n");
 }
 
 /**
@@ -301,6 +369,19 @@ export async function autoLoop(
 
       // ── Check sidecar queue before deriveState ──
       let sidecarItem: SidecarItem | undefined;
+      if (s.sidecarQueue.length === 0) {
+        const persistedRetries = loadPersistedHookRetrySidecars(s.basePath);
+        if (persistedRetries.length > 0) {
+          s.sidecarQueue.unshift(...persistedRetries);
+          deps.emitJournalEvent({
+            ts: new Date().toISOString(),
+            flowId,
+            seq: nextSeq(),
+            eventType: "sidecar-retry-resume",
+            data: { count: persistedRetries.length },
+          });
+        }
+      }
       if (s.sidecarQueue.length > 0) {
         if (uokFlags.executionGraph && s.sidecarQueue.length > 1) {
           try {
@@ -605,6 +686,9 @@ export async function autoLoop(
       });
 
       if (hookResult?.action === "pause") {
+        if (sidecarItem?.kind === "retry") {
+          clearPersistedHookRetrySidecars(s.basePath);
+        }
         deps.emitJournalEvent({ ts: new Date().toISOString(), flowId, seq: nextSeq(), eventType: "iteration-end", data: { iteration, hookPause: true, reason: hookResult.reason } });
         debugLog("autoLoop", { phase: "hook-pause", iteration, reason: hookResult.reason });
         await deps.pauseAuto(ctx, pi);
@@ -613,10 +697,34 @@ export async function autoLoop(
       }
 
       if (hookResult?.action === "retry") {
-        deps.emitJournalEvent({ ts: new Date().toISOString(), flowId, seq: nextSeq(), eventType: "iteration-end", data: { iteration, hookRetry: true, reason: hookResult.reason } });
+        const retrySidecar: SidecarItem = {
+          kind: "retry",
+          unitType: iterData.unitType,
+          unitId: iterData.unitId,
+          prompt: buildHookRetryPrompt(iterData, hookResult.reason),
+        };
+        s.sidecarQueue.unshift(retrySidecar);
+        savePersistedHookRetrySidecars(s.basePath, s.sidecarQueue);
+        deps.emitJournalEvent({
+          ts: new Date().toISOString(),
+          flowId,
+          seq: nextSeq(),
+          eventType: "iteration-end",
+          data: {
+            iteration,
+            hookRetry: true,
+            reason: hookResult.reason,
+            retryUnitType: iterData.unitType,
+            retryUnitId: iterData.unitId,
+          },
+        });
         debugLog("autoLoop", { phase: "hook-retry", iteration, reason: hookResult.reason });
         finishTurn("retry");
         continue;
+      }
+
+      if (sidecarItem?.kind === "retry") {
+        clearPersistedHookRetrySidecars(s.basePath);
       }
 
       consecutiveErrors = 0; // Iteration completed successfully
