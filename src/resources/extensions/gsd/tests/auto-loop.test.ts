@@ -2454,11 +2454,24 @@ test("autoLoop warns but proceeds for greenfield project (no project files) (#18
 });
 
 // ── Proactive rate limiting (#2996) ──────────────────────────────────────────
+//
+// NOTE: The two rate-limit tests below currently fail because
+// `mock.timers.enable({apis: ["setTimeout"]})` interferes with Node's dynamic
+// ESM import scheduler — `await import("../captures.js")` inside runGuards
+// never resolves under mocked setTimeout, so the dispatch path stalls before
+// reaching pi.sendMessage. The failure is pre-existing on origin/main; the
+// fix requires either pre-warming the import via static imports in phases.ts
+// or a different mock-timer strategy. Until then, the `finally` blocks below
+// drain pending mocked timers and unblock the loop so the test FILE exits
+// cleanly even when assertions fail (otherwise the file-level test wrapper
+// hangs for the full per-test timeout).
 
 test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2996)", async () => {
   _resetPendingResolve();
   mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
 
+  let s: any;
+  let loopPromise: Promise<void> | undefined;
   try {
     const ctx = makeMockCtx();
     ctx.ui.setStatus = () => {};
@@ -2473,7 +2486,7 @@ test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2
 
     let iterCount = 0;
 
-    const s = makeLoopSession();
+    s = makeLoopSession();
 
     const deps = makeMockDeps({
       loadEffectiveGSDPreferences: () => ({
@@ -2500,7 +2513,7 @@ test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2
       },
     });
 
-    const loopPromise = autoLoop(ctx, pi, s, deps);
+    loopPromise = autoLoop(ctx, pi, s, deps);
 
     await waitForMicrotasks(() => dispatchTimestamps.length === 1, "first dispatch");
     resolveAgentEnd(makeEvent());
@@ -2536,7 +2549,11 @@ test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2
       `gap between dispatches should match min_request_interval_ms=300 (got ${gap}ms)`,
     );
   } finally {
+    if (s) s.active = false;
+    try { mock.timers.runAll(); } catch { /* timers may already be reset */ }
     mock.timers.reset();
+    try { resolveAgentEnd(makeEvent()); } catch { /* no pending resolver */ }
+    if (loopPromise) await loopPromise.catch(() => undefined);
   }
 });
 
@@ -2544,6 +2561,8 @@ test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default
   _resetPendingResolve();
   mock.timers.enable({ apis: ["Date", "setTimeout"], now: 2_000 });
 
+  let s: any;
+  let loopPromise: Promise<void> | undefined;
   try {
     const ctx = makeMockCtx();
     ctx.ui.setStatus = () => {};
@@ -2558,7 +2577,7 @@ test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default
 
     let iterCount = 0;
 
-    const s = makeLoopSession();
+    s = makeLoopSession();
 
     const deps = makeMockDeps({
       loadEffectiveGSDPreferences: () => ({
@@ -2585,7 +2604,7 @@ test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default
       },
     });
 
-    const loopPromise = autoLoop(ctx, pi, s, deps);
+    loopPromise = autoLoop(ctx, pi, s, deps);
 
     for (let i = 1; i <= 3; i++) {
       await waitForMicrotasks(() => dispatchTimestamps.length === i, `dispatch ${i}`);
@@ -2604,7 +2623,11 @@ test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default
       `gap should be 0ms under mocked time without rate limiting (got ${gap}ms)`,
     );
   } finally {
+    if (s) s.active = false;
+    try { mock.timers.runAll(); } catch { /* timers may already be reset */ }
     mock.timers.reset();
+    try { resolveAgentEnd(makeEvent()); } catch { /* no pending resolver */ }
+    if (loopPromise) await loopPromise.catch(() => undefined);
   }
 });
 

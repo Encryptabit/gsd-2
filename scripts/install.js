@@ -449,6 +449,31 @@ function linkWorkspacePackages() {
   } catch { /* non-fatal */ }
 }
 
+// ── Step: Rebuild stale workspace dist/ in dev clones ──────────────────────
+//
+// In a dev clone, `git pull` can update package sources without touching
+// dist/, leaving stale .d.ts that breaks `npm run typecheck:extensions`.
+// ensure-workspace-builds.cjs detects mtime mismatches and rebuilds only
+// stale packages. Skipped in CI and in npm tarball installs (see the script
+// for the full skip logic).
+
+function ensureWorkspaceBuilds() {
+  const scriptPath = join(packageRoot, 'scripts', 'ensure-workspace-builds.cjs')
+  if (!existsSync(scriptPath)) return
+
+  try {
+    const result = spawnSync(process.execPath, [scriptPath], {
+      cwd: packageRoot,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      timeout: 300_000,
+    })
+    if (result.status !== 0) {
+      // Non-fatal — user can run `npm run build:pi` manually.
+      process.stderr.write('  Note: workspace rebuild check exited non-zero; run `npm run build:pi` if typecheck fails.\n')
+    }
+  } catch { /* non-fatal */ }
+}
+
 // ── Step: Verify installation ──────────────────────────────────────────────
 
 function verifyInstall(local) {
@@ -499,6 +524,7 @@ const isLocal = args.includes('--local') || args.includes('-l')
 if (IS_POSTINSTALL) {
   // Running as npm postinstall hook — just do workspace linking + deps
   linkWorkspacePackages()
+  ensureWorkspaceBuilds()
   await installChromium()
   await installRtk()
 } else {
@@ -513,6 +539,7 @@ if (IS_POSTINSTALL) {
 
   // Run postinstall steps that npm skipped
   linkWorkspacePackages()
+  ensureWorkspaceBuilds()
   await installChromium()
   await installRtk()
 
