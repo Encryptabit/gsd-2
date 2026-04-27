@@ -23,11 +23,11 @@ import { createJiti } from '@mariozechner/jiti'
 import { fileURLToPath } from 'node:url'
 import { generateWorktreeName } from './worktree-name-gen.js'
 import { existsSync } from 'node:fs'
-import { resolveBundledSourceResource } from './bundled-resource-path.js'
+import { resolveBundledGsdExtensionModule } from './bundled-resource-path.js'
 
 const jiti = createJiti(fileURLToPath(import.meta.url), { interopDefault: true, debug: false })
 const gsdExtensionPath = (...segments: string[]) =>
-  resolveBundledSourceResource(import.meta.url, 'extensions', 'gsd', ...segments)
+  resolveBundledGsdExtensionModule(import.meta.url, segments.join('/'))
 
 // Lazily-loaded extension modules (loaded once on first use via jiti)
 let _ext: ExtensionModules | null = null
@@ -47,6 +47,7 @@ interface ExtensionModules {
   nativeCommitCountBetween: (basePath: string, from: string, to: string) => number
   inferCommitType: (name: string) => string
   autoCommitCurrentBranch: (wtPath: string, reason: string, name: string) => void
+  resolveWorktreeProjectRoot: (basePath: string) => string
 }
 
 interface WorktreeDiff {
@@ -82,6 +83,7 @@ interface GitServiceModule {
 
 interface WorktreeModule {
   autoCommitCurrentBranch: ExtensionModules['autoCommitCurrentBranch']
+  resolveWorktreeProjectRoot: ExtensionModules['resolveWorktreeProjectRoot']
 }
 
 function toErrorMessage(error: unknown): string {
@@ -118,6 +120,7 @@ async function loadExtensionModules(): Promise<ExtensionModules> {
     nativeCommitCountBetween: gitBridge.nativeCommitCountBetween,
     inferCommitType: gitSvc.inferCommitType,
     autoCommitCurrentBranch: wt.autoCommitCurrentBranch,
+    resolveWorktreeProjectRoot: wt.resolveWorktreeProjectRoot,
   }
   return _ext
 }
@@ -199,6 +202,7 @@ function formatStatus(s: WorktreeStatus): string {
 
 async function handleList(basePath: string): Promise<void> {
   const ext = await loadExtensionModules()
+  basePath = ext.resolveWorktreeProjectRoot(basePath)
   const worktrees = ext.listWorktrees(basePath)
 
   if (worktrees.length === 0) {
@@ -217,6 +221,7 @@ async function handleList(basePath: string): Promise<void> {
 
 async function handleMerge(basePath: string, args: string[]): Promise<void> {
   const ext = await loadExtensionModules()
+  basePath = ext.resolveWorktreeProjectRoot(basePath)
   const name = args[0]
   if (!name) {
     // If only one worktree exists, merge it
@@ -282,6 +287,7 @@ async function doMerge(ext: ExtensionModules, basePath: string, name: string): P
 
 async function handleClean(basePath: string): Promise<void> {
   const ext = await loadExtensionModules()
+  basePath = ext.resolveWorktreeProjectRoot(basePath)
   const worktrees = ext.listWorktrees(basePath)
   if (worktrees.length === 0) {
     process.stderr.write(chalk.dim('No worktrees to clean.\n'))
@@ -311,6 +317,7 @@ async function handleClean(basePath: string): Promise<void> {
 
 async function handleRemove(basePath: string, args: string[]): Promise<void> {
   const ext = await loadExtensionModules()
+  basePath = ext.resolveWorktreeProjectRoot(basePath)
   const name = args[0]
   if (!name) {
     process.stderr.write(chalk.red('Usage: gsd worktree remove <name>\n'))
@@ -341,6 +348,7 @@ async function handleRemove(basePath: string, args: string[]): Promise<void> {
 
 async function handleStatusBanner(basePath: string): Promise<void> {
   const ext = await loadExtensionModules()
+  basePath = ext.resolveWorktreeProjectRoot(basePath)
   const worktrees = ext.listWorktrees(basePath)
   if (worktrees.length === 0) return
 
@@ -370,7 +378,7 @@ async function handleStatusBanner(basePath: string): Promise<void> {
 
 async function handleWorktreeFlag(worktreeFlag: boolean | string): Promise<void> {
   const ext = await loadExtensionModules()
-  const basePath = process.cwd()
+  const basePath = ext.resolveWorktreeProjectRoot(process.cwd())
 
   // gsd -w (no name) — resume most recent worktree with changes, or create new
   if (worktreeFlag === true) {

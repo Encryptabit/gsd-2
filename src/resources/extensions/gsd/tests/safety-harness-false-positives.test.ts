@@ -18,9 +18,11 @@ import { shouldBlockQueueExecution } from "../bootstrap/write-gate.ts";
 import {
   resetEvidence,
   recordToolCall,
+  recordToolResult,
   getEvidence,
   saveEvidenceToDisk,
   loadEvidenceFromDisk,
+  type BashEvidence,
 } from "../safety/evidence-collector.ts";
 import { validateFileChanges } from "../safety/file-change-validator.ts";
 
@@ -108,6 +110,38 @@ test("safety-harness-bug2: loadEvidenceFromDisk returns empty array when no file
   resetEvidence();
   loadEvidenceFromDisk(base, "M001", "S001", "T001");
   assert.equal(getEvidence().length, 0, "no evidence on fresh unit is correct — not a false positive");
+});
+
+test("safety-harness-bug2-race: bash evidence survives mid-unit reset between tool_call and tool_execution_end", (t) => {
+  // Reproduces the race where runUnitPhase re-fires (resetEvidence + loadEvidenceFromDisk)
+  // between a bash tool_call and its tool_execution_end. Pre-fix, the call entry lived
+  // only in memory until tool_execution_end; the reset wiped it and recordToolResult
+  // silently no-op'd, producing the "task complete with no bash calls" false positive.
+  // Post-fix, register-hooks.ts persists at tool_call time too — so the entry survives
+  // the reset via the disk round-trip.
+  const base = mkdtempSync(join(tmpdir(), "gsd-evidence-race-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  resetEvidence();
+
+  // tool_call fires: record AND persist (post-fix register-hooks.ts behavior).
+  recordToolCall("tc-bash-1", "bash", { command: "grep -q saveTodos app.js" });
+  saveEvidenceToDisk(base, "M001", "S01", "T02");
+
+  // Mid-unit race: runUnitPhase re-fires, calling resetEvidence + loadEvidenceFromDisk.
+  resetEvidence();
+  assert.equal(getEvidence().length, 0, "memory cleared by mid-unit reset");
+  loadEvidenceFromDisk(base, "M001", "S01", "T02");
+  assert.equal(getEvidence().length, 1, "entry restored from disk-persisted tool_call");
+
+  // tool_execution_end fires: result must update the restored entry by toolCallId.
+  recordToolResult("tc-bash-1", "bash", "Command exited with code 0\nfound\n", false);
+
+  const bash = getEvidence().filter((e): e is BashEvidence => e.kind === "bash");
+  assert.equal(bash.length, 1, "bash entry must survive race + result update");
+  assert.equal(bash[0].exitCode, 0, "result populated the restored entry");
+  assert.equal(bash[0].command, "grep -q saveTodos app.js", "command preserved across race");
+  assert.ok(bash[0].outputSnippet.includes("found"), "output snippet captured");
 });
 
 // ─── Bug 3: git diff HEAD~1 scope check ─────────────────────────────────────

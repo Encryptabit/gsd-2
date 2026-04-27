@@ -255,6 +255,14 @@ describe('worktree', async () => {
     "returns unchanged for non-worktree path",
   );
 
+  const nestedRepoDir = join(base, "packages", "demo");
+  mkdirSync(nestedRepoDir, { recursive: true });
+  assert.deepStrictEqual(
+    normalizePath(resolveProjectRoot(nestedRepoDir)),
+    normalizePath(base),
+    "resolves normal repo subdirectories to the project root",
+  );
+
   // Without GSD_PROJECT_ROOT, direct layout with nested subdirs
   assert.deepStrictEqual(
     resolveProjectRoot("/data/.gsd/worktrees/M003/nested"),

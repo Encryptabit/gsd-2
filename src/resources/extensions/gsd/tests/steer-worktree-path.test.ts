@@ -4,7 +4,7 @@
 
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { appendOverride, loadActiveOverrides } from "../files.ts";
@@ -71,6 +71,22 @@ describe("steer worktree path resolution (#3476)", () => {
     // does not route overrides to a dead worktree.
     const result = getAutoWorktreePath(projectRoot, "M001");
     assert.equal(result, null, "returns null for worktree without .git file");
+  });
+
+  test("getAutoWorktreePath returns null when .git is a directory", () => {
+    mkdirSync(join(worktreePath, ".git"), { recursive: true });
+
+    const result = getAutoWorktreePath(projectRoot, "M001");
+
+    assert.equal(result, null, "returns null for standalone .git directories");
+  });
+
+  test("getAutoWorktreePath returns null when .git file is not a gitdir pointer", () => {
+    writeFileSync(join(worktreePath, ".git"), "not-a-gitdir\n", "utf-8");
+
+    const result = getAutoWorktreePath(projectRoot, "M001");
+
+    assert.equal(result, null, "returns null for invalid .git files");
   });
 
   test("override routing: inactive worktree directory should not receive overrides", async () => {

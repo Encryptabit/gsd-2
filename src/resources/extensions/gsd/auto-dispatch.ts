@@ -33,7 +33,8 @@ import { parseRoadmap } from "./parsers-legacy.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { logWarning, logError } from "./workflow-logger.js";
 import { join } from "node:path";
-import { hasImplementationArtifacts, classifyMilestoneSummaryContent } from "./auto-recovery.js";
+import { hasImplementationArtifacts } from "./auto-recovery.js";
+import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
 import {
   buildDiscussMilestonePrompt,
   buildResearchMilestonePrompt,
@@ -58,6 +59,10 @@ import {
 import { resolveModelWithFallbacksForUnit } from "./preferences-models.js";
 import { resolveUokFlags } from "./uok/flags.js";
 import { selectReactiveDispatchBatch } from "./uok/execution-graph.js";
+import { getMilestonePipelineVariant } from "./milestone-scope-classifier.js";
+import { EXECUTION_ENTRY_PHASES, hasFinalizedMilestoneContext } from "./uok/plan-v2.js";
+import { isAutoActive } from "./auto.js";
+import { markDepthVerified } from "./bootstrap/write-gate.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -88,11 +93,55 @@ export interface DispatchContext {
   modelRegistry?: MinimalModelRegistry;
 }
 
+type ReassessmentChecker = typeof checkNeedsReassessment;
+
+let reassessmentChecker: ReassessmentChecker = checkNeedsReassessment;
+
+export function setReassessmentCheckerForTest(checker: ReassessmentChecker): () => void {
+  const previous = reassessmentChecker;
+  reassessmentChecker = checker;
+  return () => {
+    reassessmentChecker = previous;
+  };
+}
+
 export interface DispatchRule {
   /** Human-readable name for debugging and test identification */
   name: string;
   /** Return a DispatchAction if this rule matches, null to fall through */
   match: (ctx: DispatchContext) => Promise<DispatchAction | null>;
+}
+
+async function readUatGateVerdict(
+  basePath: string,
+  mid: string,
+  sliceId: string,
+): Promise<{ verdict: string; uatType: UatType | undefined } | null> {
+  const uatFile = resolveSliceFile(basePath, mid, sliceId, "UAT");
+  const assessmentFile = resolveSliceFile(basePath, mid, sliceId, "ASSESSMENT");
+
+  const uatContent = uatFile ? await loadFile(uatFile) : null;
+  const uatType = uatContent ? extractUatType(uatContent) : undefined;
+
+  const assessmentContent = assessmentFile ? await loadFile(assessmentFile) : null;
+  if (assessmentContent) {
+    const assessmentVerdict = extractVerdict(assessmentContent);
+    if (assessmentVerdict) {
+      return {
+        verdict: assessmentVerdict,
+        uatType: uatType ?? extractUatType(assessmentContent),
+      };
+    }
+  }
+
+  if (uatContent) {
+    const legacyUatVerdict = extractVerdict(uatContent);
+    if (legacyUatVerdict) {
+      return { verdict: legacyUatVerdict, uatType };
+    }
+  }
+
+  return null;
 }
 
 function missingSliceStop(mid: string, phase: string): DispatchAction {
@@ -243,6 +292,48 @@ export const DISPATCH_RULES: DispatchRule[] = [
     },
   },
   {
+    // #4671 — Recovery path for execution-entry phases with missing CONTEXT.md.
+    //
+    // Once `deriveStateFromDb` returns an execution-entry phase (executing /
+    // summarizing / validating-milestone / completing-milestone), the
+    // pre-planning guard at `pre-planning (no context) → discuss-milestone`
+    // no longer fires. The plan-v2 gate correctly detects the missing context
+    // but can only block — it cannot redispatch. Without this rule the
+    // milestone is stuck until `/gsd doctor heal` repairs it (and heal
+    // historically missed this check too).
+    //
+    // Fire BEFORE the execution-entry phase rules so we redispatch to
+    // `discuss-milestone` instead of hitting the plan-v2 gate.
+    name: "execution-entry phase (no context) → discuss-milestone",
+    match: async ({ state, mid, midTitle, basePath, structuredQuestionsAvailable }) => {
+      if (!EXECUTION_ENTRY_PHASES.has(state.phase)) return null;
+      // Align with the plan-v2 gate's lookup semantics: whitespace-only counts
+      // as missing, and an auto worktree may fall back to GSD_PROJECT_ROOT.
+      if (hasFinalizedMilestoneContext(basePath, mid)) return null;
+      // H6 fix (#4973): In auto-mode there is no human to answer the
+      // depth-verification ask_user_questions, so the write-gate deadlocks.
+      // Pre-mark the milestone as depth-verified so gsd_summary_save({artifact_type:"CONTEXT"})
+      // is not blocked. Safe ordering: session_switch fires clearDiscussionFlowState()
+      // (register-hooks.ts:106) before before_agent_start, which fires before resolveDispatch
+      // reaches this match fn — so this call always happens after any session-switch reset.
+      // Interactive sessions (isAutoActive()===false) are unaffected.
+      if (isAutoActive()) {
+        markDepthVerified(mid, basePath);
+      }
+      return {
+        action: "dispatch",
+        unitType: "discuss-milestone",
+        unitId: mid,
+        prompt: await buildDiscussMilestonePrompt(
+          mid,
+          midTitle,
+          basePath,
+          structuredQuestionsAvailable,
+        ),
+      };
+    },
+  },
+  {
     name: "summarizing → complete-slice",
     match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "summarizing") return null;
@@ -302,27 +393,28 @@ export const DISPATCH_RULES: DispatchRule[] = [
       // Only applies when UAT dispatch is enabled
       if (!prefs?.uat_dispatch) return null;
 
-      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
-
-      // DB-first: get completed slices from DB
-      let completedSliceIds: string[];
+      // DB-first: prefer closed slices from DB; fall back to ROADMAP on disk.
+      let closedSliceIds: string[];
       if (isDbAvailable()) {
-        completedSliceIds = getMilestoneSlices(mid)
-          .filter(s => s.status === "complete")
+        closedSliceIds = getMilestoneSlices(mid)
+          .filter(s => isClosedStatus(s.status))
           .map(s => s.id);
       } else {
-        return null;
+        // Filesystem fallback for degraded / unmigrated projects.
+        // `slice.done` in the parsed ROADMAP is the disk-level closed signal.
+        const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
+        const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
+        if (!roadmapContent) return null;
+        const roadmap = parseRoadmap(roadmapContent);
+        closedSliceIds = roadmap.slices.filter(s => s.done).map(s => s.id);
       }
 
-      for (const sliceId of completedSliceIds) {
-        const resultFile = resolveSliceFile(basePath, mid, sliceId, "UAT");
-        if (!resultFile) continue;
-        const content = await loadFile(resultFile);
-        if (!content) continue;
-        const verdict = extractVerdict(content);
-        const uatType = extractUatType(content);
+      for (const sliceId of closedSliceIds) {
+        const result = await readUatGateVerdict(basePath, mid, sliceId);
+        if (!result) continue;
+        const { verdict, uatType } = result;
 
-        if (verdict && !isAcceptableUatVerdict(verdict, uatType)) {
+        if (!isAcceptableUatVerdict(verdict, uatType)) {
           return {
             action: "stop" as const,
             reason: `UAT verdict for ${sliceId} is "${verdict}" — blocking progression until resolved.\nReview the UAT result and update the verdict to PASS, or re-run /gsd auto after fixing.`,
@@ -337,11 +429,15 @@ export const DISPATCH_RULES: DispatchRule[] = [
     name: "reassess-roadmap (post-completion)",
     match: async ({ state, mid, midTitle, basePath, prefs }) => {
       if (prefs?.phases?.skip_reassess) return null;
-      // Default reassess_after_slice to true — reassessment after slice completion
-      // is essential for roadmap integrity. Opt-out via explicit `false`.
-      const reassessEnabled = prefs?.phases?.reassess_after_slice ?? true;
+      // Default reassess_after_slice to false per ADR-003 §4 — most reassess
+      // units conclude "roadmap is fine" and burn a session for no change.
+      // The plan-slice prompt now carries a reassessment preamble so the
+      // next slice's planner does JIT roadmap verification at zero extra
+      // cost. Opt-in via explicit `reassess_after_slice: true` (e.g.
+      // burn-max profile) when you want the dedicated reassess session.
+      const reassessEnabled = prefs?.phases?.reassess_after_slice ?? false;
       if (!reassessEnabled) return null;
-      const needsReassess = await checkNeedsReassessment(basePath, mid, state);
+      const needsReassess = await reassessmentChecker(basePath, mid, state);
       if (!needsReassess) return null;
       return {
         action: "dispatch",
@@ -360,6 +456,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
     name: "needs-discussion → discuss-milestone",
     match: async ({ state, mid, midTitle, basePath, structuredQuestionsAvailable }) => {
       if (state.phase !== "needs-discussion") return null;
+      // H6 fix (#4973): auto-mark depth-verified so the write-gate does not
+      // deadlock in non-interactive (auto-mode) runs. See ordering note at
+      // "execution-entry phase (no context) → discuss-milestone" above.
+      if (isAutoActive()) {
+        markDepthVerified(mid, basePath);
+      }
       return {
         action: "dispatch",
         unitType: "discuss-milestone",
@@ -380,6 +482,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
       const contextFile = resolveMilestoneFile(basePath, mid, "CONTEXT");
       const hasContext = !!(contextFile && (await loadFile(contextFile)));
       if (hasContext) return null; // fall through to next rule
+      // H6 fix (#4973): auto-mark depth-verified so the write-gate does not
+      // deadlock in non-interactive (auto-mode) runs. See ordering note at
+      // "execution-entry phase (no context) → discuss-milestone" above.
+      if (isAutoActive()) {
+        markDepthVerified(mid, basePath);
+      }
       return {
         action: "dispatch",
         unitType: "discuss-milestone",
@@ -422,12 +530,37 @@ export const DISPATCH_RULES: DispatchRule[] = [
     },
   },
   {
+    name: "planning (require_slice_discussion) → pause for discussion (#3454)",
+    match: async ({ state, mid, basePath, prefs }) => {
+      if (state.phase !== "planning") return null;
+      if (!prefs?.phases?.require_slice_discussion) return null;
+      if (!state.activeSlice) return null;
+      // Only pause if the slice has no context file yet (discussion not done).
+      // resolveSliceFile returns null when the file does not exist on disk,
+      // but cachedReaddir could return a stale hit — verify with existsSync
+      // so the guard is defence-in-depth and the contract is explicit at the
+      // call site.
+      const sliceContextFile = resolveSliceFile(basePath, mid, state.activeSlice.id, "CONTEXT");
+      if (sliceContextFile && existsSync(sliceContextFile)) return null; // discussion already done, proceed
+      return {
+        action: "stop" as const,
+        reason: `Slice ${state.activeSlice.id} requires discussion before planning (require_slice_discussion is enabled). Run /gsd discuss to discuss this slice, then /gsd auto to resume.`,
+        level: "info" as const,
+      };
+    },
+  },
+  {
     // Keep this rule before the single-slice research rule so the multi-slice
     // path wins whenever 2+ slices are ready.
     name: "planning (multiple slices need research) → parallel-research-slices",
     match: async ({ state, mid, midTitle, basePath, prefs }) => {
       if (state.phase !== "planning") return null;
       if (prefs?.phases?.skip_research || prefs?.phases?.skip_slice_research) return null;
+      // #4781 phase 2: trivial-scope milestones skip dedicated slice research.
+      // plan-slice absorbs the lightweight discovery a trivial deliverable
+      // needs. Null result (DB unavailable / unknown) falls through to today's
+      // behavior.
+      if (await getMilestonePipelineVariant(mid) === "trivial") return null;
 
       // Load roadmap to find all slices
       const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
@@ -484,6 +617,8 @@ export const DISPATCH_RULES: DispatchRule[] = [
       // Phase skip: skip research when preference or profile says so
       if (prefs?.phases?.skip_research || prefs?.phases?.skip_slice_research)
         return null;
+      // #4781 phase 2: trivial-scope milestones skip dedicated slice research.
+      if (await getMilestonePipelineVariant(mid) === "trivial") return null;
       if (!state.activeSlice) return missingSliceStop(mid, state.phase);
       const sid = state.activeSlice!.id;
       const sTitle = state.activeSlice!.title;
@@ -662,14 +797,25 @@ export const DISPATCH_RULES: DispatchRule[] = [
       if (state.phase !== "executing" || !state.activeTask) return null;
       if (!state.activeSlice) return null; // fall through
 
-      // Only activate when reactive_execution is explicitly enabled
+      // Reactive dispatch is on by default when there are enough ready tasks to
+      // benefit from parallelism. Users opt out explicitly via
+      // `reactive_execution.enabled: false`. The downstream safety checks
+      // (graph ambiguity, ready-task count, conflict-free selection) still gate
+      // every actual dispatch, so the worst-case "default-on" outcome is the
+      // same fall-through to sequential execution as before.
       const reactiveConfig = prefs?.reactive_execution;
-      if (!reactiveConfig?.enabled) return null;
+      if (reactiveConfig?.enabled === false) return null;
 
       const sid = state.activeSlice.id;
       const sTitle = state.activeSlice.title;
-      const maxParallel = reactiveConfig.max_parallel ?? 2;
-      const subagentModel = reactiveConfig.subagent_model ?? resolveModelWithFallbacksForUnit("subagent")?.primary;
+      const maxParallel = reactiveConfig?.max_parallel ?? 2;
+      const subagentModel = reactiveConfig?.subagent_model ?? resolveModelWithFallbacksForUnit("subagent")?.primary;
+      // Default-on safety threshold: only activate reactive dispatch when at
+      // least N tasks are ready. Users who explicitly enabled reactive_execution
+      // keep the legacy threshold of 2 (matches the prior "any parallelism is
+      // better than none" intent). Default-on installs require >=3 to avoid
+      // surprising users with parallelism on small slices.
+      const minReadyTasksForReactive = reactiveConfig?.enabled === true ? 2 : 3;
 
       // Dry-run mode: max_parallel=1 means graph is derived and logged but
       // execution remains sequential
@@ -696,8 +842,9 @@ export const DISPATCH_RULES: DispatchRule[] = [
         const completed = new Set(graph.filter((n) => n.done).map((n) => n.id));
         const readyIds = getReadyTasks(graph, completed, new Set());
 
-        // Only activate reactive dispatch when >1 task is ready
-        if (readyIds.length <= 1) return null;
+        // Only activate reactive dispatch when enough tasks are ready.
+        // Threshold is 2 when explicitly opted in, 3 when default-on.
+        if (readyIds.length < minReadyTasksForReactive) return null;
 
         const uokFlags = resolveUokFlags(prefs);
         const selected = uokFlags.executionGraph
@@ -836,8 +983,13 @@ export const DISPATCH_RULES: DispatchRule[] = [
         };
       }
 
-      // Skip preference: write a minimal pass-through VALIDATION file
-      if (prefs?.phases?.skip_milestone_validation) {
+      // #4781 phase 2: trivial-scope milestones skip the dedicated validate
+      // unit — complete-milestone's own verification steps (3/4/5 in the
+      // closer prompt) are sufficient proof for contained deliverables.
+      const trivialVariant = await getMilestonePipelineVariant(mid) === "trivial";
+
+      // Skip preference OR trivial scope: write a minimal pass-through VALIDATION file.
+      if (prefs?.phases?.skip_milestone_validation || trivialVariant) {
         const mDir = resolveMilestonePath(basePath, mid);
         if (mDir) {
           if (!existsSync(mDir)) mkdirSync(mDir, { recursive: true });
@@ -845,15 +997,18 @@ export const DISPATCH_RULES: DispatchRule[] = [
             mDir,
             buildMilestoneFileName(mid, "VALIDATION"),
           );
+          const skipSource = trivialVariant
+            ? "trivial-scope pipeline variant (#4781)"
+            : "`skip_milestone_validation` preference";
           const content = [
             "---",
             "verdict: pass",
             "remediation_round: 0",
             "---",
             "",
-            "# Milestone Validation (skipped by preference)",
+            "# Milestone Validation (skipped)",
             "",
-            "Milestone validation was skipped via `skip_milestone_validation` preference.",
+            `Milestone validation was skipped via ${skipSource}.`,
           ].join("\n");
           writeFileSync(validationPath, content, "utf-8");
         }
@@ -885,7 +1040,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
 
       const existingSummary = resolveMilestoneFile(basePath, mid, "SUMMARY");
       let summaryOutcome: "success" | "failure" | "unknown" = "unknown";
-      if (existingSummary && isDbAvailable()) {
+      if (existingSummary) {
         const summaryContent = await loadFile(existingSummary);
         if (summaryContent) {
           summaryOutcome = classifyMilestoneSummaryContent(summaryContent);
@@ -924,7 +1079,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
       // Safety guard (#1703): verify the milestone produced implementation
       // artifacts (non-.gsd/ files). A milestone with only plan files and
       // zero implementation code should not be marked complete.
-      const artifactCheck = hasImplementationArtifacts(basePath);
+      const artifactCheck = hasImplementationArtifacts(basePath, mid);
       if (artifactCheck === "absent") {
         return {
           action: "stop",
@@ -979,11 +1134,15 @@ export const DISPATCH_RULES: DispatchRule[] = [
       // - success summary: reconcile DB and skip re-dispatch
       // - failure summary: pause/fail-closed
       // - unknown summary: pause/fail-closed
-      if (existingSummary && isDbAvailable()) {
-        const milestone = getMilestone(mid);
-        const status = milestone?.status ?? "missing";
+      if (existingSummary) {
+        const milestone = isDbAvailable() ? getMilestone(mid) : null;
+        const status = milestone?.status ?? (isDbAvailable() ? "missing" : "unavailable");
 
         if (summaryOutcome === "success") {
+          if (!isDbAvailable()) {
+            logWarning("dispatch", `Milestone ${mid} SUMMARY indicates completion while DB is unavailable — skipping duplicate complete-milestone dispatch`);
+            return { action: "skip" };
+          }
           try {
             updateMilestoneStatus(mid, "complete", new Date().toISOString());
             logWarning("dispatch", `Milestone ${mid} SUMMARY indicates completion while DB status was "${status}" — reconciled DB to complete (#4658)`);

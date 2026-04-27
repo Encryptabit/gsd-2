@@ -14,6 +14,7 @@ import {
   getTask,
   getSliceTasks,
   insertVerificationEvidence,
+  SCHEMA_VERSION,
 } from '../gsd-db.ts';
 import { handleCompleteTask } from '../tools/complete-task.ts';
 
@@ -99,19 +100,22 @@ function makeValidParams() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// complete-task: Schema v5 migration
+// complete-task: Fresh DB is migrated to the current schema version
 // ═══════════════════════════════════════════════════════════════════════════
 
-console.log('\n=== complete-task: schema v5 migration ===');
+console.log('\n=== complete-task: fresh DB migrates to current schema version ===');
 {
   const dbPath = tempDbPath();
   openDatabase(dbPath);
 
   const adapter = _getAdapter()!;
 
-  // Verify schema version is current (v22 — quality_gates DDL fix)
+  // Verify schema version matches the current source-of-truth constant.
+  // Asserting against SCHEMA_VERSION (not a hardcoded number) keeps this
+  // green across migration bumps while still catching a
+  // "fresh-DB-was-not-migrated" regression.
   const versionRow = adapter.prepare('SELECT MAX(version) as v FROM schema_version').get();
-  assertEq(versionRow?.['v'], 22, 'schema version should be 22');
+  assertEq(versionRow?.['v'], SCHEMA_VERSION, 'fresh DB should be migrated to current SCHEMA_VERSION');
 
   // Verify all 4 new tables exist
   const tables = adapter.prepare(
@@ -399,9 +403,12 @@ console.log('\n=== complete-task: handler idempotency ===');
   const r1 = await handleCompleteTask(params, basePath);
   assertTrue(!('error' in r1), 'first call should succeed');
 
-  // Verify only 1 task row
+  // Verify complete-task did not duplicate T01. State reconciliation may import
+  // the remaining plan task from disk so the DB stays aligned with S01-PLAN.md.
   const tasks = getSliceTasks('M001', 'S01');
-  assertEq(tasks.length, 1, 'should have exactly 1 task row after first call');
+  assertEq(tasks.length, 2, 'should have T01 plus reconciled T02 after first call');
+  assertEq(tasks.filter(t => t.id === 'T01').length, 1, 'should have exactly one T01 row after first call');
+  assertEq(tasks.find(t => t.id === 'T02')?.status, 'pending', 'T02 should be reconciled as pending');
 
   // Second call with same params — task is already complete, handler is idempotent
   const r2 = await handleCompleteTask(params, basePath);
@@ -411,9 +418,11 @@ console.log('\n=== complete-task: handler idempotency ===');
     assertEq(r2.taskId, params.taskId, 'second call should echo taskId');
   }
 
-  // Still only 1 task row (no duplication from idempotent second call)
+  // Still no duplicate rows from the idempotent second call. State reconciliation
+  // imports the remaining plan task from disk so the row count reflects T01 + T02.
   const tasksAfter = getSliceTasks('M001', 'S01');
-  assertEq(tasksAfter.length, 1, 'should still have exactly 1 task row after idempotent second call');
+  assertEq(tasksAfter.length, 2, 'should still have T01 plus reconciled T02 after idempotent second call');
+  assertEq(tasksAfter.filter(t => t.id === 'T01').length, 1, 'should still have exactly one T01 row');
 
   cleanupDir(basePath);
   cleanup(dbPath);

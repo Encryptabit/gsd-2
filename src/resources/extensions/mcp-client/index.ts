@@ -2,7 +2,8 @@
  * MCP Client Extension — Native MCP server integration for pi
  *
  * Provides on-demand access to MCP servers configured in project files
- * (.mcp.json, .gsd/mcp.json) using the @modelcontextprotocol/sdk Client
+ * (.mcp.json, .gsd/mcp.json) and the global ~/.gsd/mcp.json (or
+ * $GSD_HOME/mcp.json) using the @modelcontextprotocol/sdk Client
  * directly — no external CLI dependency required.
  *
  * Three tools:
@@ -11,7 +12,7 @@
  *   mcp_call      — Call a tool on an MCP server (lazy connect)
  */
 
-import type { ExtensionAPI } from "@gsd/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 import {
 	truncateHead,
 	DEFAULT_MAX_BYTES,
@@ -24,6 +25,7 @@ import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildHttpTransportOpts } from "./auth.js";
 import type { McpHttpAuthConfig } from "./auth.js";
@@ -33,6 +35,7 @@ import type { McpHttpAuthConfig } from "./auth.js";
 interface McpServerConfig {
 	name: string;
 	transport: "stdio" | "http" | "unknown";
+	sourcePath: string;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -58,8 +61,40 @@ interface ManagedConnection {
 // ─── Connection Manager ───────────────────────────────────────────────────────
 
 const connections = new Map<string, ManagedConnection>();
+const pendingConnections = new Map<string, Promise<Client>>();
 let configCache: McpServerConfig[] | null = null;
 const toolCache = new Map<string, McpToolSchema[]>();
+const trustedStdioServers = new Set<string>();
+
+const CHILD_ENV_ALLOWLIST = new Set([
+	"PATH",
+	"Path",
+	"HOME",
+	"USER",
+	"USERNAME",
+	"USERPROFILE",
+	"SHELL",
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	"SystemRoot",
+	"WINDIR",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"XDG_CONFIG_HOME",
+	"XDG_CACHE_HOME",
+]);
+
+function stdioTrustKey(config: McpServerConfig): string {
+	return JSON.stringify({
+		name: config.name,
+		sourcePath: config.sourcePath,
+		command: config.command,
+		args: config.args ?? [],
+		cwd: config.cwd,
+		env: config.env ?? {},
+	});
+}
 
 function readConfigs(): McpServerConfig[] {
 	if (configCache) return configCache;
@@ -69,6 +104,7 @@ function readConfigs(): McpServerConfig[] {
 	const configPaths = [
 		join(process.cwd(), ".mcp.json"),
 		join(process.cwd(), ".gsd", "mcp.json"),
+		join(process.env.GSD_HOME || join(homedir(), ".gsd"), "mcp.json"),
 	];
 
 	for (const configPath of configPaths) {
@@ -99,6 +135,7 @@ function readConfigs(): McpServerConfig[] {
 				servers.push({
 					name,
 					transport,
+					sourcePath: configPath,
 					...(hasCommand && {
 						command: config.command as string,
 						args: Array.isArray(config.args) ? (config.args as string[]) : undefined,
@@ -121,7 +158,57 @@ function readConfigs(): McpServerConfig[] {
 	return servers;
 }
 
-function getServerConfig(name: string): McpServerConfig | undefined {
+export function _buildMcpChildEnvForTest(configEnv: Record<string, string> | undefined): Record<string, string> {
+	const childEnv: Record<string, string> = {};
+	for (const key of CHILD_ENV_ALLOWLIST) {
+		const value = process.env[key];
+		if (typeof value === "string") childEnv[key] = value;
+	}
+	return {
+		...childEnv,
+		...(configEnv ? resolveEnv(configEnv) : {}),
+	};
+}
+
+export function _buildMcpTrustConfirmOptionsForTest(signal?: AbortSignal): { timeout: number; signal?: AbortSignal } {
+	return signal ? { timeout: 120_000, signal } : { timeout: 120_000 };
+}
+
+async function assertTrustedStdioServer(
+	config: McpServerConfig,
+	ctx?: ExtensionContext,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	if (config.transport !== "stdio") return undefined;
+	const trustKey = stdioTrustKey(config);
+	if (trustedStdioServers.has(trustKey)) return undefined;
+
+	if (!ctx?.hasUI) {
+		throw new Error(
+			`MCP server "${config.name}" is a project-local stdio command from ${config.sourcePath}. ` +
+			"Run this from an interactive GSD session and approve the server before use.",
+		);
+	}
+
+	const commandLine = [config.command, ...(config.args ?? [])].filter(Boolean).join(" ");
+	const envKeys = Object.keys(config.env ?? {});
+	const envSummary = envKeys.length > 0
+		? `\n\nConfigured environment keys: ${envKeys.join(", ")}`
+		: "\n\nNo explicit environment keys configured.";
+	const approved = await ctx.ui.confirm(
+		`Trust MCP server "${config.name}"?`,
+		`Project config ${config.sourcePath} wants to start:\n\n${commandLine}${envSummary}\n\nOnly approve MCP servers you trust.`,
+		_buildMcpTrustConfirmOptionsForTest(signal),
+	);
+	if (!approved) {
+		throw new Error(`MCP server "${config.name}" was not approved by the user.`);
+	}
+	return trustKey;
+}
+
+// Exported for tests (see tests/server-name-spaces.test.ts).
+// Production call sites treat this as module-private.
+export function getServerConfig(name: string): McpServerConfig | undefined {
 	const trimmed = name.trim();
 	return readConfigs().find((s) =>
 		s.name === trimmed ||
@@ -145,7 +232,7 @@ function resolveEnv(env: Record<string, string>): Record<string, string> {
 	return resolved;
 }
 
-async function getOrConnect(name: string, signal?: AbortSignal): Promise<Client> {
+async function getOrConnect(name: string, signal?: AbortSignal, ctx?: ExtensionContext): Promise<Client> {
 	const config = getServerConfig(name);
 	if (!config) throw new Error(`Unknown MCP server: "${name}". Use mcp_servers to list available servers.`);
 
@@ -154,14 +241,29 @@ async function getOrConnect(name: string, signal?: AbortSignal): Promise<Client>
 	const existing = connections.get(config.name);
 	if (existing) return existing.client;
 
+	const pending = pendingConnections.get(config.name);
+	if (pending) return pending;
+
+	const connectionPromise = connectServer(config, signal, ctx);
+	pendingConnections.set(config.name, connectionPromise);
+	try {
+		return await connectionPromise;
+	} finally {
+		pendingConnections.delete(config.name);
+	}
+}
+
+async function connectServer(config: McpServerConfig, signal?: AbortSignal, ctx?: ExtensionContext): Promise<Client> {
 	const client = new Client({ name: "gsd", version: "1.0.0" });
 	let transport: StdioClientTransport | StreamableHTTPClientTransport;
+	let approvedTrustKey: string | undefined;
 
 	if (config.transport === "stdio" && config.command) {
+		approvedTrustKey = await assertTrustedStdioServer(config, ctx, signal);
 		transport = new StdioClientTransport({
 			command: config.command,
 			args: config.args,
-			env: config.env ? { ...process.env, ...resolveEnv(config.env) } as Record<string, string> : undefined,
+			env: _buildMcpChildEnvForTest(config.env),
 			cwd: config.cwd,
 			stderr: "pipe",
 		});
@@ -179,9 +281,24 @@ async function getOrConnect(name: string, signal?: AbortSignal): Promise<Client>
 		throw new Error(`Server "${config.name}" has unsupported transport: ${config.transport}`);
 	}
 
-	await client.connect(transport, { signal, timeout: 30000 });
-	connections.set(config.name, { client, transport });
-	return client;
+	try {
+		await client.connect(transport, { signal, timeout: 30000 });
+		if (approvedTrustKey) trustedStdioServers.add(approvedTrustKey);
+		connections.set(config.name, { client, transport });
+		return client;
+	} catch (err) {
+		try {
+			await transport.close();
+		} catch {
+			// Best-effort cleanup after a failed or aborted connection attempt.
+		}
+		try {
+			await client.close();
+		} catch {
+			// Best-effort cleanup after a failed or aborted connection attempt.
+		}
+		throw err;
+	}
 }
 
 async function closeAll(): Promise<void> {
@@ -191,16 +308,23 @@ async function closeAll(): Promise<void> {
 		} catch {
 			// Best-effort cleanup
 		}
+		try {
+			await conn.transport.close();
+		} catch {
+			// Best-effort cleanup
+		}
 		connections.delete(name);
 	});
 	await Promise.allSettled(closing);
+	pendingConnections.clear();
+	trustedStdioServers.clear();
 	toolCache.clear();
 }
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
 
 function formatServerList(servers: McpServerConfig[]): string {
-	if (servers.length === 0) return "No MCP servers configured. Add servers to .mcp.json or .gsd/mcp.json.";
+	if (servers.length === 0) return "No MCP servers configured. Add servers to .mcp.json, .gsd/mcp.json, or $GSD_HOME/mcp.json (default: ~/.gsd/mcp.json).";
 
 	const lines: string[] = [`${servers.length} MCP servers configured:\n`];
 
@@ -263,7 +387,7 @@ export default function (pi: ExtensionAPI) {
 		name: "mcp_servers",
 		label: "MCP Servers",
 		description:
-			"List all available MCP servers configured in project files (.mcp.json, .gsd/mcp.json). " +
+			"List all available MCP servers configured in project files (.mcp.json, .gsd/mcp.json) or globally ($GSD_HOME/mcp.json, default: ~/.gsd/mcp.json). " +
 			"Shows server names, transport type, and connection status. Use mcp_discover to get full tool schemas for a server.",
 		promptSnippet:
 			"List available MCP servers from project configuration",
@@ -331,7 +455,7 @@ export default function (pi: ExtensionAPI) {
 			}),
 		}),
 
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
 				// Return cached tools if available
 				const cached = toolCache.get(params.server);
@@ -348,7 +472,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const client = await getOrConnect(params.server, signal);
+				const client = await getOrConnect(params.server, signal, ctx);
 				const result = await client.listTools(undefined, { signal, timeout: 30000 });
 				const tools: McpToolSchema[] = (result.tools ?? []).map((t) => ({
 					name: t.name,
@@ -423,9 +547,9 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const client = await getOrConnect(params.server, signal);
+				const client = await getOrConnect(params.server, signal, ctx);
 				const result = await client.callTool(
 					{ name: params.tool, arguments: params.args ?? {} },
 					undefined,
@@ -502,13 +626,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Lifecycle ─────────────────────────────────────────────────────────────
-
-	pi.on("session_start", async (_event, ctx) => {
-		const servers = readConfigs();
-		if (servers.length > 0) {
-			ctx.ui.notify(`MCP client ready — ${servers.length} server(s) configured`, "info");
-		}
-	});
 
 	pi.on("session_shutdown", async () => {
 		await closeAll();

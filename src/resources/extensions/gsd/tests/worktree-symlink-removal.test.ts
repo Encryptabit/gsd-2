@@ -20,7 +20,7 @@ import {
   listWorktrees,
   worktreePath,
 } from "../worktree-manager.ts";
-import { describe, test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 
@@ -28,37 +28,41 @@ function run(command: string, cwd: string): string {
   return execSync(command, { cwd, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" }).trim();
 }
 
-// Set up a test repo with .gsd/ as a symlink to an external directory,
-// mimicking the external state directory layout (~/.gsd/projects/<hash>/).
-// Resolve tmpdir to handle macOS /tmp -> /private/var/... symlink.
-const realTmp = realpathSync(tmpdir());
-const base = mkdtempSync(join(realTmp, "gsd-wt-symlink-test-"));
-const externalState = mkdtempSync(join(realTmp, "gsd-wt-symlink-ext-"));
-
-run("git init -b main", base);
-run('git config user.name "Test"', base);
-run('git config user.email "test@example.com"', base);
-
-// Create external state directory structure
-mkdirSync(join(externalState, "worktrees"), { recursive: true });
-
-// Create .gsd as a symlink to the external state directory
-symlinkSync(externalState, join(base, ".gsd"));
-
-// Verify the symlink is in place
-assert.ok(existsSync(join(base, ".gsd")), ".gsd symlink exists");
-assert.ok(
-  realpathSync(join(base, ".gsd")) === externalState,
-  ".gsd resolves to external state dir",
-);
-
-// Create initial commit so we have a valid repo
-writeFileSync(join(base, "README.md"), "# Test\n", "utf-8");
-run("git add .", base);
-run('git commit -m "init"', base);
-
-describe('worktree-symlink-removal', async () => {
+test('worktree-symlink-removal removes the git-registered symlink target safely', (t) => {
   console.log("\n=== #1852: removeWorktree with symlinked .gsd/ ===");
+
+  // Set up a test repo with .gsd/ as a symlink to an external directory,
+  // mimicking the external state directory layout (~/.gsd/projects/<hash>/).
+  // Resolve tmpdir to handle macOS /tmp -> /private/var/... symlink.
+  const realTmp = realpathSync(tmpdir());
+  const base = mkdtempSync(join(realTmp, "gsd-wt-symlink-test-"));
+  const externalState = mkdtempSync(join(realTmp, "gsd-wt-symlink-ext-"));
+  t.after(() => {
+    rmSync(base, { recursive: true, force: true });
+    rmSync(externalState, { recursive: true, force: true });
+  });
+
+  run("git init -b main", base);
+  run('git config user.name "Test"', base);
+  run('git config user.email "test@example.com"', base);
+
+  // Create external state directory structure
+  mkdirSync(join(externalState, "worktrees"), { recursive: true });
+
+  // Create .gsd as a symlink to the external state directory
+  symlinkSync(externalState, join(base, ".gsd"));
+
+  // Verify the symlink is in place
+  assert.ok(existsSync(join(base, ".gsd")), ".gsd symlink exists");
+  assert.ok(
+    realpathSync(join(base, ".gsd")) === externalState,
+    ".gsd resolves to external state dir",
+  );
+
+  // Create initial commit so we have a valid repo
+  writeFileSync(join(base, "README.md"), "# Test\n", "utf-8");
+  run("git add .", base);
+  run('git commit -m "init"', base);
 
   // Create a worktree — git will resolve the symlink and register
   // the worktree at the external path
@@ -127,7 +131,4 @@ describe('worktree-symlink-removal', async () => {
   const listed = listWorktrees(base);
   assert.deepStrictEqual(listed.length, 0, "no worktrees listed after removal");
 
-  // Cleanup
-  rmSync(base, { recursive: true, force: true });
-  rmSync(externalState, { recursive: true, force: true });
 });

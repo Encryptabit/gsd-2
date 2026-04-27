@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { pickTrustedConfigurationValue } from "./trusted-config.js";
 import { GsdClient, ThinkingLevel } from "./gsd-client.js";
 import { registerChatParticipant } from "./chat-participant.js";
 import { GsdSidebarProvider } from "./sidebar.js";
@@ -15,18 +16,32 @@ import { GsdDiagnosticBridge } from "./diagnostics.js";
 import { GsdLineDecorationManager } from "./line-decorations.js";
 import { GsdGitIntegration } from "./git-integration.js";
 import { GsdPermissionManager } from "./permissions.js";
+import { GsdPlanViewerProvider } from "./plan-viewer.js";
 
 let client: GsdClient | undefined;
 let sidebarProvider: GsdSidebarProvider | undefined;
 let fileDecorations: GsdFileDecorationProvider | undefined;
 let sessionTreeProvider: GsdSessionTreeProvider | undefined;
 let activityFeedProvider: GsdActivityFeedProvider | undefined;
+let planViewerProvider: GsdPlanViewerProvider | undefined;
 let changeTracker: GsdChangeTracker | undefined;
 let scmProvider: GsdScmProvider | undefined;
 let diagnosticBridge: GsdDiagnosticBridge | undefined;
 let lineDecorations: GsdLineDecorationManager | undefined;
 let gitIntegration: GsdGitIntegration | undefined;
 let permissionManager: GsdPermissionManager | undefined;
+
+function getTrustedConfigurationValue<T>(section: string, key: string, fallback: T): T {
+	const config = vscode.workspace.getConfiguration(section);
+	return pickTrustedConfigurationValue(config.inspect<T>(key), fallback);
+}
+
+export function resolveTrustedGsdStartupConfig(): { binaryPath: string; autoStart: boolean } {
+	return {
+		binaryPath: getTrustedConfigurationValue("gsd", "binaryPath", "gsd"),
+		autoStart: getTrustedConfigurationValue("gsd", "autoStart", false),
+	};
+}
 
 function requireConnected(): boolean {
 	if (!client?.isConnected) {
@@ -42,8 +57,9 @@ function handleError(err: unknown, context: string): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+	const startupConfig = resolveTrustedGsdStartupConfig();
 	const config = vscode.workspace.getConfiguration("gsd");
-	const binaryPath = config.get<string>("binaryPath", "gsd");
+	const binaryPath = startupConfig.binaryPath;
 	const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 
 	client = new GsdClient(binaryPath, cwd);
@@ -138,6 +154,14 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		activityFeedProvider,
 		vscode.window.registerTreeDataProvider(GsdActivityFeedProvider.viewId, activityFeedProvider),
+	);
+
+	// -- Plan view ----------------------------------------------------------
+
+	planViewerProvider = new GsdPlanViewerProvider(client);
+	context.subscriptions.push(
+		planViewerProvider,
+		vscode.window.registerTreeDataProvider(GsdPlanViewerProvider.viewId, planViewerProvider),
 	);
 
 	// -- Change tracker & SCM provider -------------------------------------
@@ -924,6 +948,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 	);
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand("gsd.clearPlan", () => {
+			planViewerProvider?.clear();
+		}),
+	);
+
 	// -- Permission commands ------------------------------------------------
 
 	context.subscriptions.push(
@@ -960,7 +990,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// -- Auto-start ---------------------------------------------------------
 
-	if (config.get<boolean>("autoStart", false)) {
+	if (startupConfig.autoStart) {
 		vscode.commands.executeCommand("gsd.start");
 	}
 }

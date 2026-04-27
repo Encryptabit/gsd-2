@@ -262,5 +262,15 @@ Examples:
     await handleScan(trimmed.replace(/^scan\s*/, "").trim(), ctx, pi);
     return true;
   }
+  if (
+    trimmed === "worktree" ||
+    trimmed.startsWith("worktree ") ||
+    trimmed === "wt" ||
+    trimmed.startsWith("wt ")
+  ) {
+    const { handleWorktree } = await import("../../commands-worktree.js");
+    await handleWorktree(trimmed.replace(/^(worktree|wt)\s*/, "").trim(), ctx);
+    return true;
+  }
   return false;
 }

@@ -10,14 +10,28 @@ Your working directory is `{{workingDirectory}}`. All file reads, writes, and sh
 
 All slices are done. You are closing out the milestone — verifying that the assembled work actually delivers the promised outcome, writing the milestone summary, and updating project state. The milestone summary is the final record. After you finish, the system merges the worktree back to the integration branch. If there are queued milestones, the next one starts its own research → plan → execute cycle from a clean slate — the milestone summary is how it learns what was already built.
 
-All relevant context has been preloaded below — the roadmap, all slice summaries, requirements, decisions, and project context are inlined. Start working immediately without re-reading these files.
+Preloaded context below — the roadmap, compact slice-summary excerpts, requirements, decisions, and project context. **Slice summaries are excerpts, not full files.** They include frontmatter fields, section heads (deviations, known limitations, follow-ups), and short narrative only. When drafting LEARNINGS, the Decision Re-evaluation table, or cross-slice narrative, Read the full slice SUMMARY.md files listed under "On-demand Slice Summaries" — do that selectively as needed, not preemptively.
+
+Start with what the excerpts give you. Read full files when the section heads signal richer context you need.
+
+**On-demand Read ordering:** Complete all slice SUMMARY Reads you need for cross-slice synthesis, the Decision Re-evaluation table, and LEARNINGS **before** calling `gsd_complete_milestone` (step 10). Once that tool runs, the milestone is marked complete in the DB — running out of tool budget between step 10 and the LEARNINGS write (step 12) leaves the milestone committed without its LEARNINGS artifact.
+
+### Delegate Review Work
+
+This unit runs under the `planning-dispatch` tools-policy: you may use the `subagent` tool to delegate review work that benefits from a fresh context window. For non-trivial milestones, delegate before drafting LEARNINGS:
+
+- **Cross-slice integrations or new public APIs** → dispatch the **reviewer** agent with the milestone diff and roadmap; treat its findings as input to your Decision Re-evaluation and LEARNINGS sections.
+- **Touched auth, network, parsing, file IO, shell exec, or crypto** → dispatch the **security** agent for an OWASP-style audit across the merged slices.
+- **Significant test surface added or changed** → dispatch the **tester** agent to assess coverage gaps relative to the milestone success criteria.
+
+Subagents read the diff and report findings — they do **not** write user source. Apply their feedback into the milestone summary and any captured decisions before calling `gsd_complete_milestone`.
 
 {{inlinedContext}}
 
 Then:
 1. Use the **Milestone Summary** output template from the inlined context above
 2. {{skillActivation}}
-3. **Verify code changes exist.** Run `git diff --stat HEAD $(git merge-base HEAD main) -- ':!.gsd/'` (or the equivalent for the integration branch). If no non-`.gsd/` files appear in the diff, the milestone produced only planning artifacts and no actual code. Record this as a **verification failure**.
+3. **Verify code changes exist.** Compare the milestone against its integration branch (usually `main`, `master`, or the recorded integration branch), using the merge-base as the older revision and `HEAD` as the newer revision. If that branch diff lists non-`.gsd/` files, code-change verification passes. If `HEAD` is already the same commit as the integration branch/merge-base (a retry-on-main self-diff), do **not** treat the empty branch diff as proof of missing code. Instead, inspect milestone-scoped commit evidence such as recent commits with `GSD-Unit: {{milestoneId}}` or production `GSD-Task: Sxx/Tyy` trailers whose diff also touches `.gsd/milestones/{{milestoneId}}/`, then check those commits for non-`.gsd/` files. Only record a **verification failure** when neither the branch diff nor milestone-scoped commit evidence shows implementation files.
 4. Verify each **success criterion** from the milestone definition in `{{roadmapPath}}`. For each criterion, confirm it was met with specific evidence from slice summaries, test results, or observable behavior. Record any criterion that was NOT met as a **verification failure**.
 5. Verify the milestone's **definition of done** — all slices are `[x]`, all slice summaries exist, and any cross-slice integration points work correctly. Record any unmet items as a **verification failure**.
 6. If the roadmap includes a **Horizontal Checklist**, verify each item was addressed during the milestone. Note unchecked items in the milestone summary.

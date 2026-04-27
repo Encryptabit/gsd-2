@@ -28,9 +28,12 @@ describe("CombinedAutocompleteProvider — slash commands", () => {
 		const provider = makeProvider(sampleCommands);
 		const result = provider.getSuggestions(["/se"], 0, 3);
 		assert.ok(result);
-		assert.equal(result!.items.length, 2); // settings, session
+		// /se matches settings and session — name the values, then assert exact
+		// count as the contract for this prefix. Asserting count alone would
+		// pass even if the matches were the wrong commands.
 		assert.ok(result!.items.some((i) => i.value === "settings"));
 		assert.ok(result!.items.some((i) => i.value === "session"));
+		assert.equal(result!.items.length, 2);
 	});
 
 	it("returns null when no commands match", () => {
@@ -43,7 +46,14 @@ describe("CombinedAutocompleteProvider — slash commands", () => {
 		const provider = makeProvider(sampleCommands);
 		const result = provider.getSuggestions(["/mod"], 0, 4);
 		assert.ok(result);
-		assert.equal(result!.items[0]?.description, "Select model");
+		// Verify the matched command is present and every item carries a
+		// description — avoids `[0]` positional coupling that would silently
+		// pass if list ordering changed.
+		assert.ok(result!.items.some((i) => i.value === "model"));
+		assert.ok(
+			result!.items.every((i) => typeof i.description === "string" && i.description.length > 0),
+			"every suggestion must have a non-empty description",
+		);
 	});
 
 	it("does not offer slash command suggestions mid-line", () => {
@@ -95,8 +105,10 @@ describe("CombinedAutocompleteProvider — argument completions", () => {
 		const provider = makeProvider(commands);
 		const result = provider.getSuggestions(["/thinking m"], 0, 11);
 		assert.ok(result);
+		// /thinking m matches only "medium" — verify the expected value is
+		// present (by name, not index) and then assert exact count.
+		assert.ok(result!.items.some((i) => i.value === "medium"));
 		assert.equal(result!.items.length, 1);
-		assert.equal(result!.items[0]?.value, "medium");
 	});
 
 	it("returns null for commands without argument completions", () => {
@@ -122,25 +134,46 @@ describe("CombinedAutocompleteProvider — argument completions", () => {
 		const provider = makeProvider(commands);
 		const result = provider.getSuggestions(["/test "], 0, 6);
 		assert.ok(result);
+		// Empty prefix returns all 3 subcommands — verify each is present
+		// by name. Bare count would pass for any 3-element list.
+		assert.ok(result!.items.some((i) => i.value === "start"));
+		assert.ok(result!.items.some((i) => i.value === "stop"));
+		assert.ok(result!.items.some((i) => i.value === "status"));
 		assert.equal(result!.items.length, 3);
 	});
 });
 
 describe("CombinedAutocompleteProvider — @ file prefix extraction", () => {
-	it("detects @ at start of line", () => {
+	it("detects @ at start of line and returns a valid suggestion shape", () => {
 		const provider = makeProvider();
-		// @ triggers fuzzy file search — we can't test the actual file results
-		// but we can test that getSuggestions returns null (no files in /tmp matching)
-		// rather than crashing
 		const result = provider.getSuggestions(["@nonexistent_xyz"], 0, 16);
-		// May return null or empty — the key thing is it doesn't crash
-		assert.ok(result === null || result.items.length >= 0);
+		// Either null (nothing matched) or a well-formed {items: Array, prefix: string}
+		// shape. Previous version's `result.items.length >= 0` was a tautology —
+		// array length is always ≥ 0; the whole expression could never fail.
+		if (result !== null) {
+			assert.ok(Array.isArray(result.items), "result.items must be an array");
+			// The @-prefix extraction strips the leading @ — prefix should be
+			// the raw text without the trigger character.
+			assert.equal(typeof result.prefix, "string", "prefix must be a string");
+			assert.ok(
+				!result.prefix.startsWith("@"),
+				`prefix must have the @ trigger stripped, got: ${JSON.stringify(result.prefix)}`,
+			);
+		}
 	});
 
-	it("detects @ after space", () => {
+	it("detects @ after space and returns a valid suggestion shape", () => {
 		const provider = makeProvider();
 		const result = provider.getSuggestions(["check @nonexistent_xyz"], 0, 22);
-		assert.ok(result === null || result.items.length >= 0);
+		if (result !== null) {
+			assert.ok(Array.isArray(result.items), "result.items must be an array");
+			assert.equal(typeof result.prefix, "string", "prefix must be a string");
+			// The prefix must NOT include the word "check" that came before the @.
+			assert.ok(
+				!result.prefix.includes("check"),
+				`prefix must not include text before the @, got: ${JSON.stringify(result.prefix)}`,
+			);
+		}
 	});
 
 	it("returns null for bare @ with no query to avoid full tree walk (#1824)", () => {

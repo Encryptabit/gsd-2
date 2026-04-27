@@ -26,6 +26,7 @@
 | `/gsd history` | View execution history (supports `--cost`, `--phase`, `--model` filters) |
 | `/gsd forensics` | Full-access GSD debugger — structured anomaly detection, unit traces, and LLM-guided root-cause analysis for auto-mode failures |
 | `/gsd cleanup` | Clean up GSD state files and stale worktrees |
+| `/gsd worktree` (`/gsd wt`) | Manage GSD worktrees from the TUI |
 | `/gsd visualize` | Open workflow visualizer (progress, deps, metrics, timeline) |
 | `/gsd export --html` | Generate self-contained HTML report for current or completed milestone |
 | `/gsd export --html --all` | Generate retrospective reports for all milestones at once |
@@ -154,10 +155,16 @@ Plugins are plain YAML (`.yaml`) or markdown (`.md`) files. See
 
 | Command | Description |
 |---------|-------------|
-| `/gsd extensions list` | List all extensions and their status |
+| `/gsd extensions list` | List all extensions and their status. User-installed entries show `[user]` plus the install source |
 | `/gsd extensions enable <id>` | Enable a disabled extension |
 | `/gsd extensions disable <id>` | Disable an extension |
 | `/gsd extensions info <id>` | Show extension details |
+| `/gsd extensions install <spec>` | Install a user extension. `<spec>` is an npm package, a git URL, or a local path. Restart GSD to activate. (v2.78) |
+| `/gsd extensions uninstall <id>` | Remove a user-installed extension. Warns if other extensions depend on it. (v2.78) |
+| `/gsd extensions update [id]` | Update a single user-installed npm extension to its latest version, or all of them when `id` is omitted. Git/local installs are skipped — reinstall to update. (v2.78) |
+| `/gsd extensions validate <path>` | Validate an extension package directory against the manifest schema before publishing or installing. (v2.78) |
+
+Install sources are auto-detected: starts with `http(s)://` or ends with `.git` → git clone; contains `/` or `.` and exists on disk → local copy; otherwise → `npm pack`. Installed extensions land in `~/.gsd/extensions/<id>/` and the registry records the source so `update` can re-fetch.
 
 ## cmux Integration
 
@@ -184,6 +191,24 @@ Enable with `github.enabled: true` in preferences. Requires `gh` CLI installed a
 | Command | Description |
 |---------|-------------|
 | `/worktree` (`/wt`) | Git worktree lifecycle — create, switch, merge, remove |
+
+## GSD Worktree Commands
+
+Use `/gsd worktree` from an active TUI session to inspect and clean up GSD-managed worktrees without leaving the conversation. `/gsd wt` is an alias.
+
+| Command | Description |
+|---------|-------------|
+| `/gsd worktree list` | Show each worktree, branch, path, clean/unmerged/uncommitted status, diff stats, and commit count. Alias: `/gsd worktree ls`. |
+| `/gsd worktree merge [name]` | Merge a worktree into the detected main branch, then remove the worktree and its branch. The name is optional only when exactly one worktree exists. |
+| `/gsd worktree clean` | Remove only merged or empty worktrees. Worktrees with unmerged diffs or uncommitted changes are kept. |
+| `/gsd worktree remove <name> [--force]` | Remove a named worktree and delete its branch. Refuses unmerged or uncommitted work unless `--force` is supplied. Alias: `/gsd worktree rm`. |
+
+Safety behavior:
+
+- `merge` auto-commits dirty worktree changes before merging when possible.
+- `merge` refuses to continue if the project root is not on the detected main branch; check out the main branch and rerun it.
+- `clean` never deletes worktrees with pending file changes.
+- `remove` requires `--force` to discard unmerged or uncommitted work.
 
 ## Telegram Commands
 

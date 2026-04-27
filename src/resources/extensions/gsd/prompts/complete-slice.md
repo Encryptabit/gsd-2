@@ -20,6 +20,16 @@ All relevant context has been preloaded below — the slice plan, all task summa
 
 **Match effort to complexity.** A simple slice with 1-2 tasks needs a brief summary and lightweight verification. A complex slice with 5 tasks across multiple subsystems needs thorough verification and a detailed summary. Scale the work below accordingly.
 
+### Delegate Review Work
+
+This unit runs under the `planning-dispatch` tools-policy: you may use the `subagent` tool to delegate review work that benefits from a fresh context window. Strongly consider delegating when the slice is non-trivial:
+
+- **Cross-cutting code or new abstractions** → dispatch the **reviewer** agent with the slice diff and plan; apply High/Critical findings before completing.
+- **Touched auth, network, parsing, file IO, shell exec, or crypto** → dispatch the **security** agent for an OWASP-style audit.
+- **Added or modified tests** → dispatch the **tester** agent to assess coverage gaps relative to the slice plan.
+
+Subagents read the diff and report findings — they do **not** write user source. You remain responsible for acting on their feedback before calling `gsd_complete_slice` with `milestoneId` and `sliceId`.
+
 Then:
 1. Use the **Slice Summary** and **UAT** output templates from the inlined context above
 2. {{skillActivation}}

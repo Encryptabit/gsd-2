@@ -45,8 +45,12 @@ let providerRegistered = false;
 /**
  * Probe Ollama and register discovered models.
  * Safe to call multiple times — re-discovers and re-registers.
+ *
+ * Exported for tests (see ollama-auth-mode.test.ts, ollama-status-indicator.test.ts)
+ * so a fake HTTP endpoint can drive the registration/unregistration paths.
+ * Production callers always go through the session_start handler below.
  */
-async function probeAndRegister(pi: ExtensionAPI): Promise<boolean> {
+export async function probeAndRegister(pi: ExtensionAPI): Promise<boolean> {
 	const running = await client.isRunning();
 	if (!running) {
 		if (providerRegistered) {
@@ -115,17 +119,31 @@ export default function ollama(pi: ExtensionAPI) {
 		// In headless/auto mode, await the probe so the fallback resolver can
 		// see Ollama before the first LLM call (#3531 race condition).
 		// In interactive mode, keep it async for fast startup.
+		// Surface probe failures under GSD_DEBUG so users can diagnose silent
+		// "Ollama is missing from /model" reports without patching dist/. The
+		// probe still soft-fails (registration is best-effort) — we just stop
+		// dropping the error on the floor. See #4982.
+		const debugOllama = (where: string, error: unknown): void => {
+			if (process.env.GSD_DEBUG) {
+				const msg = error instanceof Error ? error.message : String(error);
+				process.stderr.write(`[ollama] ${where} probe failed: ${msg}\n`);
+			}
+		};
+
 		if (!ctx.hasUI) {
 			try {
 				await probeAndRegister(pi);
-			} catch { /* non-fatal */ }
+			} catch (error) {
+				debugOllama("headless", error);
+			}
 		} else {
 			probeAndRegister(pi)
 				.then((found) => {
 					ctx.ui.setStatus("ollama", found ? "Ollama" : undefined);
 				})
-				.catch(() => {
+				.catch((error) => {
 					ctx.ui.setStatus("ollama", undefined);
+					debugOllama("interactive", error);
 				});
 		}
 	});

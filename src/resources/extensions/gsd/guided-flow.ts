@@ -13,7 +13,7 @@ import { loadFile, saveFile } from "./files.js";
 import { isDbAvailable, getMilestoneSlices } from "./gsd-db.js";
 import { parseRoadmapSlices } from "./roadmap-slices.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
-import { buildSkillActivationBlock } from "./auto-prompts.js";
+import { buildDiscussMilestonePrompt, buildSkillActivationBlock } from "./auto-prompts.js";
 import { deriveState } from "./state.js";
 import { invalidateAllCaches } from "./cache.js";
 import { startAutoDetached } from "./auto.js";
@@ -25,6 +25,7 @@ import {
 } from "./interrupted-session.js";
 import { listUnitRuntimeRecords, clearUnitRuntimeRecord } from "./unit-runtime.js";
 import { resolveExpectedArtifactPath } from "./auto.js";
+import { getHomeDir } from "./home-dir.js";
 import {
   gsdRoot, milestonesDir, resolveMilestoneFile, resolveMilestonePath,
   resolveSliceFile, resolveSlicePath, resolveGsdRootFile, relGsdRootFile,
@@ -38,13 +39,15 @@ import { isInheritedRepo } from "./repo-identity.js";
 import { ensureGitignore, ensurePreferences, untrackRuntimeFiles } from "./gitignore.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
 import { resolveUokFlags } from "./uok/flags.js";
-import { ensurePlanV2Graph } from "./uok/plan-v2.js";
-import { detectProjectState } from "./detection.js";
+import { ensurePlanV2Graph, isMissingFinalizedContextResult } from "./uok/plan-v2.js";
+import { detectProjectState, hasGsdBootstrapArtifacts } from "./detection.js";
 import { showProjectInit, offerMigration } from "./init-wizard.js";
 import { validateDirectory } from "./validate-directory.js";
 import { showConfirm } from "../shared/tui.js";
 import { debugLog } from "./debug-logger.js";
-import { findMilestoneIds, nextMilestoneId, reserveMilestoneId, getReservedMilestoneIds, clearReservedMilestoneIds } from "./milestone-ids.js";
+import { findMilestoneIds, clearReservedMilestoneIds } from "./milestone-ids.js";
+import { nextMilestoneIdReserved } from "./milestone-id-reservation.js";
+export { nextMilestoneIdReserved } from "./milestone-id-reservation.js";
 import { parkMilestone, discardMilestone } from "./milestone-actions.js";
 import { selectAndApplyModel } from "./auto-model-selection.js";
 import { DISCUSS_TOOLS_ALLOWLIST } from "./constants.js";
@@ -72,20 +75,6 @@ export {
 } from "./guided-flow-queue.js";
 import { logWarning } from "./workflow-logger.js";
 
-// ─── ID Generation with Reservation ─────────────────────────────────────────
-
-/**
- * Generate the next milestone ID, accounting for reserved IDs, and reserve it.
- * Ensures any preview ID shown in the UI matches what `gsd_milestone_generate_id`
- * will later return.
- */
-function nextMilestoneIdReserved(existingIds: string[], uniqueEnabled: boolean): string {
-  const allIds = [...new Set([...existingIds, ...getReservedMilestoneIds()])];
-  const id = nextMilestoneId(allIds, uniqueEnabled);
-  reserveMilestoneId(id);
-  return id;
-}
-
 function needsPlanV2Gate(state: GSDState): boolean {
   return state.phase === "executing"
     || state.phase === "summarizing"
@@ -93,24 +82,29 @@ function needsPlanV2Gate(state: GSDState): boolean {
     || state.phase === "completing-milestone";
 }
 
+type PlanV2GateDecision = "pass" | "recover-missing-context" | "block";
+
 function runPlanV2Gate(
   ctx: ExtensionContext,
   basePath: string,
   state: GSDState,
-): boolean {
+): PlanV2GateDecision {
   const prefs = loadEffectiveGSDPreferences()?.preferences;
   const uokFlags = resolveUokFlags(prefs);
-  if (!uokFlags.planV2 || !needsPlanV2Gate(state)) return true;
+  if (!uokFlags.planV2 || !needsPlanV2Gate(state)) return "pass";
   const compiled = ensurePlanV2Graph(basePath, state);
   if (!compiled.ok) {
+    if (isMissingFinalizedContextResult(compiled)) {
+      return "recover-missing-context";
+    }
     const reason = compiled.reason ?? "plan-v2 compilation failed";
     ctx.ui.notify(
       `Plan gate failed-closed: ${reason}. Complete plan/discuss artifacts before execution.\n\nIf this keeps happening, try: /gsd doctor heal`,
       "error",
     );
-    return false;
+    return "block";
   }
-  return true;
+  return "pass";
 }
 
 // ─── Commit Instruction Helpers ──────────────────────────────────────────────
@@ -310,12 +304,29 @@ function extractAssistantText(msg: any): string {
 
 /**
  * Return true if the assistant message contains any tool-use block.
+ *
+ * The canonical pi-ai `AssistantMessage.content` (see packages/pi-ai/src/types.ts)
+ * uses `type: "toolCall"` and `type: "serverToolUse"` for tool invocations —
+ * every provider (anthropic-direct, claude-code-cli, openai, etc.) normalizes
+ * incoming tool blocks into these two shapes before they reach guided-flow.
+ *
+ * The Anthropic API wire shape `"tool_use"` / `"server_tool_use"` does NOT appear
+ * in the internal AssistantMessage — those literals are only used when sending
+ * messages back out to the Anthropic API. Matching them here was a latent bug:
+ * `hasToolUse` returned `false` for every real tool call, which let the
+ * empty-turn nudge fire and pre-empt MCP tools that block on the user
+ * (e.g. `ask_user_questions`). See investigation in PR for #4658.
  */
 function hasToolUse(msg: any): boolean {
   if (!msg) return false;
   const content = msg.content;
   if (!Array.isArray(content)) return false;
-  return content.some((b: any) => b && typeof b === "object" && (b.type === "tool_use" || b.type === "tool-use"));
+  return content.some(
+    (b: any) =>
+      b &&
+      typeof b === "object" &&
+      (b.type === "toolCall" || b.type === "serverToolUse"),
+  );
 }
 
 /**
@@ -597,7 +608,7 @@ async function dispatchWorkflow(
     });
   }
 
-  const workflowPath = process.env.GSD_WORKFLOW_PATH ?? join(process.env.HOME ?? "~", ".gsd", "agent", "GSD-WORKFLOW.md");
+  const workflowPath = process.env.GSD_WORKFLOW_PATH ?? join(getHomeDir(), ".gsd", "agent", "GSD-WORKFLOW.md");
   const workflow = readFileSync(workflowPath, "utf-8");
 
   pi.sendMessage(
@@ -810,14 +821,19 @@ export async function showHeadlessMilestoneCreation(
   // Ensure .gsd/ is bootstrapped
   bootstrapGsdProject(basePath);
 
+  const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
+  await ensureDbOpen(basePath);
+
   // Generate next milestone ID
   const existingIds = findMilestoneIds(basePath);
   const prefs = loadEffectiveGSDPreferences();
-  const nextId = nextMilestoneIdReserved(existingIds, prefs?.preferences?.unique_milestone_ids ?? false);
+  const nextId = nextMilestoneIdReserved(existingIds, prefs?.preferences?.unique_milestone_ids ?? false, basePath);
 
-  // Create milestone directory
-  const milestoneDir = join(gsdRoot(basePath), "milestones", nextId, "slices");
-  mkdirSync(milestoneDir, { recursive: true });
+  // Fix #4996: Do NOT pre-create the milestone directory here.
+  // atomicWriteAsync (used by all artifact writers) calls mkdir lazily before
+  // each write, so every path through saveArtifactToDb / saveFile is already
+  // lazy-mkdir-safe. Pre-creating the dir before the discuss flow runs leaves
+  // an orphan stub if discuss is abandoned — that stub later skews nextMilestoneId.
 
   // Build and dispatch the headless discuss prompt
   const prompt = buildHeadlessDiscussPrompt(nextId, seedContext, basePath);
@@ -825,8 +841,13 @@ export async function showHeadlessMilestoneCreation(
   // Set pending auto start (auto-mode triggers on "Milestone X ready." via checkAutoStartAfterDiscuss)
   pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, createdAt: Date.now() });
 
-  // Dispatch — headless milestone creation is a planning activity
-  await dispatchWorkflow(pi, prompt, "gsd-run", ctx, "plan-milestone");
+  // Dispatch as discuss-milestone. The LLM writes PROJECT.md, REQUIREMENTS.md,
+  // and CONTEXT.md, then calls gsd_plan_milestone — this is semantically the
+  // discuss path, just non-interactive. Using "plan-milestone" here caused
+  // model/tool routing to skip discuss-flow tool scoping and
+  // `checkAutoStartAfterDiscuss` guardrails that rely on the
+  // "discuss-"-prefixed unitType.
+  await dispatchWorkflow(pi, prompt, "gsd-run", ctx, "discuss-milestone");
 }
 
 
@@ -1027,9 +1048,11 @@ export async function showDiscuss(
         fastPathInstruction: "",
       }), "gsd-discuss", ctx, "discuss-milestone");
     } else if (choice === "skip_milestone") {
+      const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
+      await ensureDbOpen(basePath);
       const milestoneIds = findMilestoneIds(basePath);
       const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
       pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, step: false, createdAt: Date.now() });
       await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId, `New milestone ${nextId}.`, basePath), "gsd-run", ctx, "discuss-milestone");
     }
@@ -1434,7 +1457,7 @@ async function handleMilestoneActions(
   if (choice === "skip") {
     const milestoneIds = findMilestoneIds(basePath);
     const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-    const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+    const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
     pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode, createdAt: Date.now() });
     await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
       `New milestone ${nextId}.`,
@@ -1481,9 +1504,7 @@ export async function showSmartEntry(
   // A zombie .gsd/ state (symlink exists but missing PREFERENCES.md and
   // milestones/) must trigger the init wizard, not skip it (#2942).
   const gsdPath = gsdRoot(basePath);
-  const hasBootstrapArtifacts = existsSync(gsdPath)
-    && (existsSync(join(gsdPath, "PREFERENCES.md"))
-        || existsSync(join(gsdPath, "milestones")));
+  const hasBootstrapArtifacts = hasGsdBootstrapArtifacts(gsdPath);
 
   if (!hasBootstrapArtifacts) {
     const detection = detectProjectState(basePath);
@@ -1520,6 +1541,11 @@ export async function showSmartEntry(
   // ── Ensure .gitignore has baseline patterns ──────────────────────────
   ensureGitignore(basePath);
   untrackRuntimeFiles(basePath);
+
+  {
+    const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
+    await ensureDbOpen(basePath);
+  }
 
   // ── Self-heal stale runtime records from crashed auto-mode sessions ──
   selfHealRuntimeRecords(basePath, ctx);
@@ -1573,7 +1599,8 @@ export async function showSmartEntry(
     logWarning("guided", `STATE.md rebuild failed: ${(err as Error).message}`);
   }
 
-  if (!runPlanV2Gate(ctx, basePath, state)) return;
+  const planV2GateDecision = runPlanV2Gate(ctx, basePath, state);
+  if (planV2GateDecision === "block") return;
 
   if (!state.activeMilestone?.id) {
     // Guard: if a discuss session is already in flight, don't re-inject the prompt.
@@ -1622,7 +1649,7 @@ export async function showSmartEntry(
     }
 
     const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-    const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+    const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
     const isFirst = milestoneIds.length === 0;
 
     if (isFirst) {
@@ -1661,6 +1688,23 @@ export async function showSmartEntry(
   const milestoneId = state.activeMilestone.id;
   const milestoneTitle = state.activeMilestone.title;
 
+  if (planV2GateDecision === "recover-missing-context") {
+    pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId, step: stepMode, createdAt: Date.now() });
+    await dispatchWorkflow(
+      pi,
+      await buildDiscussMilestonePrompt(
+        milestoneId,
+        milestoneTitle,
+        basePath,
+        getStructuredQuestionsAvailability(pi, ctx),
+      ),
+      "gsd-discuss",
+      ctx,
+      "discuss-milestone",
+    );
+    return;
+  }
+
   // ── All milestones complete → New milestone ──────────────────────────
   if (state.phase === "complete") {
     const choice = await showNextAction(ctx, {
@@ -1685,7 +1729,7 @@ export async function showSmartEntry(
     if (choice === "new_milestone") {
       const milestoneIds = findMilestoneIds(basePath);
       const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
 
       pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode, createdAt: Date.now() });
       await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
@@ -1753,7 +1797,7 @@ export async function showSmartEntry(
     } else if (choice === "skip_milestone") {
       const milestoneIds = findMilestoneIds(basePath);
       const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+      const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
       pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode, createdAt: Date.now() });
       await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
         `New milestone ${nextId}.`,
@@ -1850,7 +1894,7 @@ export async function showSmartEntry(
       } else if (choice === "skip_milestone") {
         const milestoneIds = findMilestoneIds(basePath);
         const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
-        const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds);
+        const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
         pendingAutoStartMap.set(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode, createdAt: Date.now() });
         await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
           `New milestone ${nextId}.`,

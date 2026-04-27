@@ -84,10 +84,11 @@ import {
   clearInFlightTools,
   isToolInvocationError,
   isQueuedUserMessageSkip,
+  isDeterministicPolicyError,
 } from "./auto-tool-tracking.js";
 import { closeoutUnit } from "./auto-unit-closeout.js";
 import { recoverTimedOutUnit } from "./auto-timeout-recovery.js";
-import { selectAndApplyModel, resolveModelId } from "./auto-model-selection.js";
+import { selectAndApplyModel, resolveModelId, clearToolBaseline } from "./auto-model-selection.js";
 import { resetRoutingHistory, recordOutcome } from "./routing-history.js";
 import {
   checkPostUnitHooks,
@@ -169,6 +170,7 @@ import {
   buildLoopRemediationSteps,
   reconcileMergeState,
 } from "./auto-recovery.js";
+import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
 import { resolveDispatch, DISPATCH_RULES } from "./auto-dispatch.js";
 import { getErrorMessage } from "./error-utils.js";
 import { recoverFailedMigration } from "./migrate-external.js";
@@ -230,10 +232,7 @@ import { reorderForCaching } from "./prompt-ordering.js";
 // ─── Session State ─────────────────────────────────────────────────────────
 
 import {
-  AutoSession,
-  MAX_UNIT_DISPATCHES,
   STUB_RECOVERY_THRESHOLD,
-  MAX_LIFETIME_DISPATCHES,
   NEW_SESSION_TIMEOUT_MS,
 } from "./auto/session.js";
 import type {
@@ -242,9 +241,7 @@ import type {
   StartModel,
 } from "./auto/session.js";
 export {
-  MAX_UNIT_DISPATCHES,
   STUB_RECOVERY_THRESHOLD,
-  MAX_LIFETIME_DISPATCHES,
   NEW_SESSION_TIMEOUT_MS,
 } from "./auto/session.js";
 export type {
@@ -252,11 +249,12 @@ export type {
   UnitRouting,
   StartModel,
 } from "./auto/session.js";
+import { autoSession as s } from "./auto-runtime-state.js";
 
 // ── ENCAPSULATION INVARIANT ─────────────────────────────────────────────────
 // ALL mutable auto-mode state lives in the AutoSession class (auto/session.ts).
 // This file must NOT declare module-level `let` or `var` variables for state.
-// The single `s` instance below is the only mutable module-level binding.
+// The single shared `s` instance below is the only mutable AutoSession binding.
 //
 // When adding features or fixing bugs:
 //   - New mutable state → add a property to AutoSession, not a module-level variable
@@ -265,7 +263,6 @@ export type {
 //
 // Tests in auto-session-encapsulation.test.ts enforce this invariant.
 // ─────────────────────────────────────────────────────────────────────────────
-const s = new AutoSession();
 
 /** Throttle STATE.md rebuilds — at most once per 30 seconds */
 const STATE_REBUILD_MIN_INTERVAL_MS = 30_000;
@@ -334,6 +331,25 @@ function normalizeSessionFilePath(raw: unknown): string | null {
   if (!isAbsolute(candidate)) return null;
   if (!candidate.toLowerCase().endsWith(".jsonl")) return null;
   return candidate;
+}
+
+function synthesizePausedSessionRecovery(
+  basePath: string,
+  unitType: string,
+  unitId: string,
+  sessionFile: string,
+): ReturnType<typeof synthesizeCrashRecovery> {
+  const activityDir = join(gsdRoot(basePath), "activity");
+  return synthesizeCrashRecovery(basePath, unitType, unitId, sessionFile, activityDir);
+}
+
+export function _synthesizePausedSessionRecoveryForTest(
+  basePath: string,
+  unitType: string,
+  unitId: string,
+  sessionFile: string,
+): ReturnType<typeof synthesizeCrashRecovery> {
+  return synthesizePausedSessionRecovery(basePath, unitType, unitId, sessionFile);
 }
 
 export function startAutoDetached(
@@ -485,6 +501,11 @@ export function isAutoActive(): boolean {
   return s.active;
 }
 
+/** Test-only seam for validating auto-mode guards (#4704). Do not use in production code. */
+export function _setAutoActiveForTest(active: boolean): void {
+  s.active = active;
+}
+
 export function isAutoPaused(): boolean {
   return s.paused;
 }
@@ -538,12 +559,14 @@ export function markToolEnd(toolCallId: string): void {
 /**
  * Record a tool invocation error on the current session (#2883).
  * Called from tool_execution_end when a GSD tool fails with isError.
- * Only stores the error if it matches the tool-invocation-error pattern
- * (malformed/truncated JSON), not normal business-logic errors.
+ * Stores the error if it matches:
+ *   - tool-invocation-error pattern (malformed/truncated JSON)
+ *   - queued-user-message skip pattern
+ *   - deterministic policy rejection (#4973, e.g. context_write_blocked)
  */
 export function recordToolInvocationError(toolName: string, errorMsg: string): void {
   if (!s.active) return;
-  if (isToolInvocationError(errorMsg) || isQueuedUserMessageSkip(errorMsg)) {
+  if (isToolInvocationError(errorMsg) || isQueuedUserMessageSkip(errorMsg) || isDeterministicPolicyError(errorMsg)) {
     s.lastToolInvocationError = `${toolName}: ${errorMsg}`;
   }
 }
@@ -789,6 +812,43 @@ export async function stopAuto(
   if (!s.active && !s.paused) return;
   const loadedPreferences = loadEffectiveGSDPreferences(s.basePath || undefined)?.preferences;
   const reasonSuffix = reason ? ` — ${reason}` : "";
+
+  // #4764 — telemetry: record the exit reason and whether the current milestone
+  // was merged before we entered stopAuto. This is the producer-side signal for
+  // the #4761 orphan class: milestoneMerged=false + currentMilestoneId present
+  // is exactly the pattern that strands work.
+  try {
+    const { emitAutoExit } = await import("./worktree-telemetry.js");
+    type AutoExitReason =
+      | "pause" | "stop" | "blocked" | "merge-conflict" | "merge-failed"
+      | "slice-merge-conflict" | "all-complete" | "no-active-milestone" | "other";
+    // Normalize the free-form reason to a closed set so the telemetry
+    // aggregator buckets stably. Raw detail is preserved in the phases.ts
+    // notification and the notify'd error string.
+    const rawReason = reason ?? "stop";
+    const normalizedReason: AutoExitReason = rawReason.startsWith("Blocked:")
+      ? "blocked"
+      : rawReason.startsWith("Merge conflict")
+        ? "merge-conflict"
+        : rawReason.startsWith("Merge error") || rawReason.startsWith("Merge failed")
+          ? "merge-failed"
+          : rawReason.startsWith("slice-merge-conflict")
+            ? "slice-merge-conflict"
+            : rawReason === "All milestones complete"
+              ? "all-complete"
+              : rawReason === "No active milestone"
+                ? "no-active-milestone"
+                : rawReason === "stop" || rawReason === "pause"
+                  ? rawReason
+                  : "other";
+    emitAutoExit(s.originalBasePath || s.basePath, {
+      reason: normalizedReason,
+      milestoneId: s.currentMilestoneId ?? undefined,
+      milestoneMerged: s.milestoneMergedInPhases === true,
+    });
+  } catch (err) {
+    logWarning("engine", `auto-exit telemetry failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   try {
     // ── Step 1: Timers and locks ──
@@ -1044,6 +1104,12 @@ export async function stopAuto(
     if (ctx) initHealthWidget(ctx);
     restoreProjectRootEnv();
     restoreMilestoneLockEnv();
+
+    // Drop the active-tool baseline so a subsequent /gsd auto run on the
+    // same `pi` instance recaptures from the live tool set rather than
+    // restoring this session's snapshot and silently undoing any tool
+    // changes the user made between sessions (#4959 / CodeRabbit).
+    if (pi) clearToolBaseline(pi);
 
     // Reset all session state in one call
     s.reset();
@@ -1345,6 +1411,15 @@ export async function startAuto(
     return;
   }
 
+  // On a *fresh* start, drop any stale active-tool baseline left by a prior
+  // auto session that didn't run stopAuto cleanly.  Skip on resume: pauseAuto
+  // leaves the last provider-trimmed active tools in place, so clearing here
+  // would let the next selectAndApplyModel recapture that already-narrowed
+  // set as the new baseline — exactly the cross-unit poisoning this PR is
+  // fixing (#4959 / CodeRabbit Major).  The pre-pause baseline survives in
+  // the WeakMap keyed by `pi`.
+  if (!s.paused) clearToolBaseline(pi);
+
   const requestedStepMode = options?.step ?? false;
   const interruptedAssessment = options?.interrupted ?? null;
   if (options?.milestoneLock !== undefined) {
@@ -1414,7 +1489,15 @@ export async function startAuto(
           // Validate the milestone still exists and isn't already complete (#1664).
           const mDir = resolveMilestonePath(base, meta.milestoneId);
           const summaryFile = resolveMilestoneFile(base, meta.milestoneId, "SUMMARY");
-          if (!mDir || summaryFile) {
+          let summaryIsTerminal = false;
+          if (summaryFile) {
+            try {
+              summaryIsTerminal = classifyMilestoneSummaryContent(readFileSync(summaryFile, "utf-8")) !== "failure";
+            } catch {
+              summaryIsTerminal = false;
+            }
+          }
+          if (!mDir || summaryIsTerminal) {
             try { unlinkSync(pausedPath); } catch (err) {
               if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
                 logWarning("session", `pause file cleanup failed: ${err instanceof Error ? err.message : String(err)}`, { file: "auto.ts" });
@@ -1503,16 +1586,6 @@ export async function startAuto(
       s.paused = false;
       ctx.ui.notify(`Cannot resume: ${resumeLock.reason}`, "error");
       return;
-    }
-
-    // Lock acquired — now safe to delete the pause file
-    if (s.pausedSessionFile) {
-      try { unlinkSync(s.pausedSessionFile); } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          logWarning("session", `pause file cleanup failed: ${err instanceof Error ? err.message : String(err)}`, { file: "auto.ts" });
-        }
-      }
-      s.pausedSessionFile = null;
     }
 
     s.paused = false;
@@ -1612,13 +1685,11 @@ export async function startAuto(
     invalidateAllCaches();
 
     if (s.pausedSessionFile) {
-      const activityDir = join(gsdRoot(s.basePath), "activity");
-      const recovery = synthesizeCrashRecovery(
+      const recovery = synthesizePausedSessionRecovery(
         s.basePath,
         s.currentUnit?.type ?? s.pausedUnitType ?? "unknown",
         s.currentUnit?.id ?? s.pausedUnitId ?? "unknown",
-        s.pausedSessionFile ?? undefined,
-        activityDir,
+        s.pausedSessionFile,
       );
       if (recovery && recovery.trace.toolCallCount > 0) {
         s.pendingCrashRecovery = recovery.prompt;
@@ -1740,7 +1811,7 @@ const widgetStateAccessors: WidgetStateAccessors = {
  * Ensure directories, branches, and other prerequisites exist before
  * dispatching a unit. The LLM should never need to mkdir or git checkout.
  */
-function ensurePreconditions(
+export function ensurePreconditions(
   unitType: string,
   unitId: string,
   base: string,
@@ -1750,6 +1821,17 @@ function ensurePreconditions(
 
   const mDir = resolveMilestonePath(base, mid);
   if (!mDir) {
+    // Fix #4996: When dispatching a slice unit against an unrecognised milestone,
+    // only create the directory if the milestone has a DB row.
+    // Without this guard, forward-referenced unit IDs (e.g. from REQUIREMENTS.md)
+    // silently scaffold empty stub directories that later skew nextMilestoneId.
+    if (sid !== undefined) {
+      const hasDbRow = isDbAvailable() && getMilestone(mid) != null;
+      if (!hasDbRow) {
+        logWarning("engine", `ensurePreconditions: skipping mkdir for unrecognised milestone ${mid} referenced by slice unit ${unitId} — no DB row exists`, { file: "auto.ts" });
+        return;
+      }
+    }
     const newDir = join(milestonesDir(base), mid);
     mkdirSync(join(newDir, "slices"), { recursive: true });
   }
@@ -1782,15 +1864,20 @@ export async function dispatchHookUnit(
   hookModel: string | undefined,
   targetBasePath: string,
 ): Promise<boolean> {
+  const wasActive = s.active;
+  const previousBasePath = s.basePath;
+  const previousCurrentUnit = s.currentUnit ? { ...s.currentUnit } : null;
+
   if (!s.active) {
     s.active = true;
     s.stepMode = true;
     s.cmdCtx = ctx as ExtensionCommandContext;
-    s.basePath = targetBasePath;
     s.autoStartTime = Date.now();
     s.currentUnit = null;
     s.pendingQuickTasks = [];
   }
+
+  s.basePath = targetBasePath;
 
   const hookUnitType = `hook/${hookName}`;
   const hookStartedAt = Date.now();
@@ -1800,6 +1887,23 @@ export async function dispatchHookUnit(
     id: triggerUnitId,
     startedAt: hookStartedAt,
   };
+
+  // Ensure cwd matches basePath BEFORE newSession() captures it (#1389).
+  // newSession() snapshots process.cwd() during construction; chdir-ing
+  // afterward leaves the session rooted to whatever cwd was when the call
+  // was made. Must be synchronous — no awaits between chdir and newSession.
+  try { if (process.cwd() !== s.basePath) process.chdir(s.basePath); } catch (err) {
+    const msg = `Failed to chdir before hook newSession (basePath: ${s.basePath}): ${err instanceof Error ? err.message : String(err)}`;
+    logWarning("engine", msg, { file: "auto.ts", basePath: s.basePath, error: err instanceof Error ? err.message : String(err) });
+    ctx.ui.notify(`${msg}. Cancelling hook dispatch to avoid running in the wrong directory.`, "error");
+    if (wasActive) {
+      s.basePath = previousBasePath;
+      s.currentUnit = previousCurrentUnit;
+    } else {
+      s.reset();
+    }
+    return false;
+  }
 
   const result = await s.cmdCtx!.newSession();
   if (result.cancelled) {
@@ -1856,11 +1960,6 @@ export async function dispatchHookUnit(
 
   ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
   ctx.ui.notify(`Running post-unit hook: ${hookName}`, "info");
-
-  // Ensure cwd matches basePath before hook dispatch (#1389)
-  try { if (process.cwd() !== s.basePath) process.chdir(s.basePath); } catch (err) {
-    logWarning("engine", `chdir failed before hook dispatch: ${err instanceof Error ? err.message : String(err)}`, { file: "auto.ts" });
-  }
 
   debugLog("dispatchHookUnit", {
     phase: "send-message",

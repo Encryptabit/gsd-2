@@ -56,9 +56,43 @@ const KNOWN_MODELS: Array<[pattern: string, caps: ModelCapability]> = [
 	["llama2", { contextWindow: 4096, maxTokens: 4096, ollamaOptions: { num_ctx: 4096 } }],
 
 	// ─── Qwen family ────────────────────────────────────────────────────
+	// Long-variant entries MUST appear before the bare `qwen3` base —
+	// `baseName.startsWith(pattern)` returns true for `qwen3.5`/`qwen3-coder`/
+	// `qwen3-next` against `qwen3`, and the first match wins (#4991).
+	// ref: qwen3-next 1M ctx — https://qwen.ai/blog?id=qwen3-next
+	["qwen3-next", { contextWindow: 1048576, maxTokens: 32768, ollamaOptions: { num_ctx: 1048576 } }],
+	// ref: qwen3-coder 256K ctx — https://qwenlm.github.io/blog/qwen3-coder/
+	["qwen3-coder", { contextWindow: 262144, maxTokens: 32768, ollamaOptions: { num_ctx: 262144 } }],
+	// ref: qwen3.5 / qwen3.6 1M ctx — Ollama Cloud release notes
+	["qwen3.6", { contextWindow: 1048576, maxTokens: 32768, ollamaOptions: { num_ctx: 1048576 } }],
+	["qwen3.5", { contextWindow: 1048576, maxTokens: 32768, ollamaOptions: { num_ctx: 1048576 } }],
 	["qwen3", { contextWindow: 131072, maxTokens: 32768, ollamaOptions: { num_ctx: 131072 } }],
 	["qwen2.5", { contextWindow: 131072, maxTokens: 32768, ollamaOptions: { num_ctx: 131072 } }],
 	["qwen2", { contextWindow: 131072, maxTokens: 32768, ollamaOptions: { num_ctx: 131072 } }],
+
+	// ─── GLM family (Z.ai, Ollama Cloud) ────────────────────────────────
+	// ref: glm 4.6 / 5.x 200K ctx — https://docs.z.ai/devpack/using5.1
+	// Long-variant entries before bare `glm-5` / `glm-4` would-be bases to
+	// avoid prefix shadowing (#4991).
+	["glm-5.1", { contextWindow: 204800, maxTokens: 16384, ollamaOptions: { num_ctx: 204800 } }],
+	["glm-5", { contextWindow: 204800, maxTokens: 16384, ollamaOptions: { num_ctx: 204800 } }],
+	["glm-4.6", { contextWindow: 204800, maxTokens: 16384, ollamaOptions: { num_ctx: 204800 } }],
+	["glm-4", { contextWindow: 131072, maxTokens: 16384, ollamaOptions: { num_ctx: 131072 } }],
+
+	// ─── Kimi K2 (Moonshot, Ollama Cloud) ──────────────────────────────
+	// ref: kimi-k2 256K ctx — https://platform.moonshot.ai/docs
+	// Same shadowing concern: kimi-k2-thinking and kimi-k2.{5,6} must
+	// match before any future bare `kimi-k2` entry (#4991).
+	["kimi-k2-thinking", { contextWindow: 262144, maxTokens: 16384, ollamaOptions: { num_ctx: 262144 } }],
+	["kimi-k2.6", { contextWindow: 262144, maxTokens: 16384, ollamaOptions: { num_ctx: 262144 } }],
+	["kimi-k2.5", { contextWindow: 262144, maxTokens: 16384, ollamaOptions: { num_ctx: 262144 } }],
+	["kimi-k2", { contextWindow: 262144, maxTokens: 16384, ollamaOptions: { num_ctx: 262144 } }],
+
+	// ─── MiniMax M2 (Ollama Cloud) ─────────────────────────────────────
+	// ref: minimax-m2 1M ctx — https://www.minimax.io/news/minimax-m2
+	["minimax-m2.7", { contextWindow: 1048576, maxTokens: 16384, ollamaOptions: { num_ctx: 1048576 } }],
+	["minimax-m2.5", { contextWindow: 1048576, maxTokens: 16384, ollamaOptions: { num_ctx: 1048576 } }],
+	["minimax-m2", { contextWindow: 1048576, maxTokens: 16384, ollamaOptions: { num_ctx: 1048576 } }],
 
 	// ─── Gemma family ───────────────────────────────────────────────────
 	["gemma3", { contextWindow: 131072, maxTokens: 16384, ollamaOptions: { num_ctx: 131072 } }],

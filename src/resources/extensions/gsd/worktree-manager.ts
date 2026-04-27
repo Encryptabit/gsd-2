@@ -30,6 +30,7 @@ import {
   nativeDiffNameStatus,
   nativeDiffNumstat,
   nativeGetCurrentBranch,
+  nativeIsAncestor,
   nativeLogOneline,
   nativeMergeSquash,
   nativeWorktreeAdd,
@@ -37,6 +38,12 @@ import {
   nativeWorktreePrune,
   nativeWorktreeRemove,
 } from "./native-git-bridge.js";
+import { emitCanonicalRootRedirect } from "./worktree-telemetry.js";
+import {
+  isGsdWorktreePath,
+  normalizeWorktreePathForCompare,
+  resolveWorktreeProjectRoot,
+} from "./worktree-root.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -73,6 +80,20 @@ function normalizePathForComparison(path: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+function normalizeBasePathForWorktreeOps(basePath: string): string {
+  const resolved = resolveWorktreeProjectRoot(basePath);
+  if (
+    isGsdWorktreePath(basePath) &&
+    normalizeWorktreePathForCompare(resolved) === normalizeWorktreePathForCompare(basePath)
+  ) {
+    throw new GSDError(
+      GSD_GIT_ERROR,
+      `Cannot resolve project root from worktree path: ${basePath}. Run the command from the project root or set GSD_PROJECT_ROOT.`,
+    );
+  }
+  return resolved;
+}
+
 // ─── resolveGitDir ─────────────────────────────────────────────────────────
 
 /**
@@ -104,7 +125,7 @@ export function resolveGitDir(basePath: string): string {
 }
 
 export function worktreesDir(basePath: string): string {
-  return join(basePath, ".gsd", "worktrees");
+  return join(resolveWorktreeProjectRoot(basePath), ".gsd", "worktrees");
 }
 
 export function worktreePath(basePath: string, name: string): string {
@@ -132,6 +153,58 @@ export function isInsideWorktreesDir(basePath: string, targetPath: string): bool
   return resolved === wtDir || resolved.startsWith(wtDir + sep);
 }
 
+/**
+ * Return the canonical path from which a milestone's artifacts should be read.
+ *
+ * If a live git worktree exists for this milestone at `.gsd/worktrees/<MID>/`
+ * (directory present AND a `.git` file indicating a registered worktree),
+ * returns that worktree path. Otherwise returns `basePath` unchanged.
+ *
+ * Readers that cross the session/worktree boundary (validators, the bootstrap
+ * audit, cross-session state queries) should route through this helper so they
+ * don't silently read stale project-root state while live work sits in the
+ * worktree. Writers and tools whose contract is "operate on the path I was
+ * given" should NOT use this helper — they preserve the legacy behavior.
+ *
+ * A stale worktree directory (no `.git` file) is treated as absent. The
+ * createWorktree() path already cleans these up, but readers must not trust
+ * them in the window before cleanup runs.
+ *
+ * Fixes #4761. Used by the #4762 audit for the pre-completion orphan case.
+ */
+export function resolveCanonicalMilestoneRoot(
+  basePath: string,
+  milestoneId: string,
+): string {
+  if (!milestoneId || /[\/\\]|\.\./.test(milestoneId)) return basePath;
+
+  const wtPath = worktreePath(basePath, milestoneId);
+  if (!existsSync(wtPath)) return basePath;
+
+  // A registered git worktree has a .git *file* (not directory) containing
+  // "gitdir: <path>". A standalone .git directory indicates a copied repo
+  // or nested standalone repo — not a worktree registered with this project —
+  // and must not be treated as the canonical root.
+  const gitPath = join(wtPath, ".git");
+  if (!existsSync(gitPath)) return basePath;
+  try {
+    const stat = lstatSync(gitPath);
+    if (!stat.isFile()) return basePath;
+  } catch {
+    return basePath;
+  }
+
+  // #4764 — record the redirect so we can measure how often the #4761 fix
+  // would have mattered. Best-effort; emit is silent on any failure.
+  try {
+    emitCanonicalRootRedirect(basePath, milestoneId, wtPath);
+  } catch (err) {
+    logWarning("worktree", `canonical-root-redirect telemetry failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return wtPath;
+}
+
 // ─── Core Operations ───────────────────────────────────────────────────────
 
 /**
@@ -141,6 +214,8 @@ export function isInsideWorktreesDir(basePath: string, targetPath: string): bool
  * @param opts.branch — override the default `worktree/<name>` branch name
  */
 export function createWorktree(basePath: string, name: string, opts: { branch?: string; startPoint?: string; reuseExistingBranch?: boolean } = {}): WorktreeInfo {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   // Validate name: alphanumeric, hyphens, underscores only
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
     throw new GSDError(GSD_PARSE_ERROR, `Invalid worktree name "${name}". Use only letters, numbers, hyphens, and underscores.`);
@@ -174,6 +249,17 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
   // otherwise fall back to the repo's detected main branch.
   const startPoint = opts.startPoint ?? nativeDetectMainBranch(basePath);
 
+  // Reject early if startPoint resolves to an empty/invalid ref. On an
+  // unborn branch (zero-commit repo) nativeDetectMainBranch returns "",
+  // which would flow into `git worktree add ... ""` and crash with
+  // `fatal: not a valid object name`. (Issue #4980 HIGH-9)
+  if (!startPoint || startPoint.length === 0) {
+    throw new GSDError(
+      GSD_GIT_ERROR,
+      "Repository has no commits yet (unborn branch). Make an initial commit before creating worktrees.",
+    );
+  }
+
   // Check if the branch already exists (leftover from a previous worktree)
   const branchAlreadyExists = nativeBranchExists(basePath, branch);
 
@@ -196,6 +282,21 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
       // from prior sessions that must not be reset.
       nativeWorktreeAdd(basePath, wtPath, branch);
     } else {
+      // Ancestry guard: refuse to force-reset a branch that has commits not
+      // reachable from startPoint. A crash-then-resume cycle that didn't
+      // write the resume file would silently orphan prior-session commits
+      // (recoverable from reflog for 90d, then gone — branch is also
+      // deleted at teardown). (Issue #4980 HIGH-3)
+      const branchIsAncestor = nativeIsAncestor(basePath, branch, startPoint);
+      if (!branchIsAncestor) {
+        throw new GSDError(
+          GSD_GIT_ERROR,
+          `Branch "${branch}" already exists with commits not reachable from "${startPoint}". ` +
+          `Refusing to force-reset — would orphan prior work. ` +
+          `If you intend to keep those commits, retry with reuseExistingBranch=true. ` +
+          `If you intend to discard, run \`git branch -D ${branch}\` manually first.`,
+        );
+      }
       // Reset the stale branch to the start point, then attach worktree to it
       nativeBranchForceReset(basePath, branch, startPoint);
       nativeWorktreeAdd(basePath, wtPath, branch);
@@ -217,6 +318,8 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
  * Uses native worktree list and filters to those under .gsd/worktrees/.
  */
 export function listWorktrees(basePath: string): WorktreeInfo[] {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const baseVariants = [resolve(basePath)];
   if (existsSync(basePath)) {
     baseVariants.push(realpathSync(basePath));
@@ -379,6 +482,8 @@ export function removeWorktree(
   name: string,
   opts: { deleteBranch?: boolean; force?: boolean; branch?: string } = {},
 ): void {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   let wtPath = worktreePath(basePath, name);
   const branch = opts.branch ?? worktreeBranchName(name);
   const { deleteBranch = true, force = true } = opts;
@@ -451,17 +556,38 @@ export function removeWorktree(
         (line: string) => line.startsWith("+") || line.startsWith("-"),
       );
       if (hasSubmoduleChanges) {
-        // Stash submodule changes so they are not lost during force removal.
-        // The stash is created in the worktree before it's torn down.
+        // Save submodule changes to a labeled rescue branch instead of the
+        // shared stash list. Stash is per-repo (not per-worktree), so an
+        // entry created here would appear in the user's main-tree stash
+        // list and reference paths that disappear after worktree removal.
+        // A branch persists in the shared .git refs after worktree removal
+        // and is discoverable via `git branch --list 'gsd/submodule-rescue/*'`.
+        // (Issue #4980 HIGH-11)
+        const rescueBranch = `gsd/submodule-rescue/${name}-${Date.now()}`;
         try {
           execFileSync(
-            "git", ["stash", "push", "-m", "gsd: auto-stash submodule changes before worktree teardown"],
+            "git", ["add", "-A"],
             { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
           );
-          logWarning("reconcile", `Stashed uncommitted submodule changes before worktree teardown`, { worktree: name, path: resolvedWtPath });
-        } catch {
-          // Stash failed — warn the user that submodule changes may be lost
-          logWarning("reconcile", `Submodule changes detected — stash failed, changes may be lost during force removal`, { worktree: name, path: resolvedWtPath });
+          execFileSync(
+            "git", ["commit", "-m", `gsd: rescue submodule changes from worktree ${name}`, "--allow-empty"],
+            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+          );
+          execFileSync(
+            "git", ["branch", rescueBranch, "HEAD"],
+            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+          );
+          logWarning(
+            "reconcile",
+            `Saved uncommitted submodule changes to rescue branch ${rescueBranch}`,
+            { worktree: name, path: resolvedWtPath, rescueBranch },
+          );
+        } catch (err) {
+          logWarning(
+            "reconcile",
+            `Submodule rescue branch creation failed — changes may be lost during force removal: ${err instanceof Error ? err.message : String(err)}`,
+            { worktree: name, path: resolvedWtPath },
+          );
         }
       }
     } catch (e) {
@@ -559,6 +685,7 @@ const SKIP_PATHS = [
   ".gsd/worktrees/",
   ".gsd/runtime/",
   ".gsd/activity/",
+  ".gsd/audit/",
   ".gsd/forensics/",
   ".gsd/parallel/",
   ".gsd/journal/",
@@ -612,6 +739,8 @@ function parseDiffNameStatus(entries: { status: string; path: string }[]): Workt
  * Returns a summary of added, modified, and removed GSD artifacts.
  */
 export function diffWorktreeGSD(basePath: string, name: string): WorktreeDiffSummary {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -627,6 +756,8 @@ export function diffWorktreeGSD(basePath: string, name: string): WorktreeDiffSum
  * content, this correctly returns an empty diff.
  */
 export function diffWorktreeAll(basePath: string, name: string): WorktreeDiffSummary {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -640,6 +771,8 @@ export function diffWorktreeAll(basePath: string, name: string): WorktreeDiffSum
  * Uses direct diff (not merge-base) so the preview matches the actual merge outcome.
  */
 export function diffWorktreeNumstat(basePath: string, name: string): FileLineStat[] {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -658,6 +791,8 @@ export function diffWorktreeNumstat(basePath: string, name: string): FileLineSta
  * Returns the raw unified diff for LLM consumption.
  */
 export function getWorktreeGSDDiff(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -669,6 +804,8 @@ export function getWorktreeGSDDiff(basePath: string, name: string): string {
  * Returns the raw unified diff for LLM consumption.
  */
 export function getWorktreeCodeDiff(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -679,6 +816,8 @@ export function getWorktreeCodeDiff(basePath: string, name: string): string {
  * Get commit log for the worktree branch since it diverged from main.
  */
 export function getWorktreeLog(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -693,6 +832,8 @@ export function getWorktreeLog(basePath: string, name: string): string {
  * Returns the merge commit message.
  */
 export function mergeWorktreeToMain(basePath: string, name: string, commitMessage: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
   const current = nativeGetCurrentBranch(basePath);

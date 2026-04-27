@@ -151,6 +151,9 @@ Failures:
 **Suggest what to test when no arguments are given.**
 
 **A. Check recent changes:**
+
+> **Working directory check:** if your dispatch context specifies a working directory and `pwd` does not match it, prefix the git commands below with `-C <that path>` (e.g. `git -C /path/to/worktree diff --name-only HEAD~5`).
+
 - Run `git diff --name-only HEAD~5` to find recently changed files
 - Run `git diff --name-only --cached` for staged files
 - Filter to source files (exclude configs, docs, lockfiles)

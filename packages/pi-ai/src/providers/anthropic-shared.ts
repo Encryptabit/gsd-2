@@ -262,6 +262,11 @@ export function convertMessages(
 	cacheControl?: { type: "ephemeral"; ttl?: "1h" },
 ): MessageParam[] {
 	const params: MessageParam[] = [];
+	// Indices into `params` for messages flagged with `cacheBreakpoint: true` —
+	// e.g. compaction summaries. We apply cache_control to the most recent one
+	// (in addition to the last message) so the stable summary + kept-history
+	// block can earn cache reads on every post-compaction turn. (#5027)
+	const breakpointIndices: number[] = [];
 
 	const transformedMessages = transformMessagesWithReport(messages, model, normalizeToolCallId, "anthropic-messages");
 
@@ -275,6 +280,7 @@ export function convertMessages(
 						role: "user",
 						content: sanitizeSurrogates(msg.content),
 					});
+					if (msg.cacheBreakpoint) breakpointIndices.push(params.length - 1);
 				}
 			} else {
 				const blocks: ContentBlockParam[] = msg.content.map((item) => {
@@ -306,6 +312,7 @@ export function convertMessages(
 					role: "user",
 					content: filteredBlocks,
 				});
+				if (msg.cacheBreakpoint) breakpointIndices.push(params.length - 1);
 			}
 		} else if (msg.role === "assistant") {
 			const blocks: ContentBlockParam[] = [];
@@ -403,29 +410,48 @@ export function convertMessages(
 	}
 
 	if (cacheControl && params.length > 0) {
-		const lastMessage = params[params.length - 1];
-		if (lastMessage.role === "user") {
-			if (Array.isArray(lastMessage.content)) {
-				const lastBlock = lastMessage.content[lastMessage.content.length - 1];
-				if (
-					lastBlock &&
-					(lastBlock.type === "text" || lastBlock.type === "image" || lastBlock.type === "tool_result")
-				) {
-					(lastBlock as any).cache_control = cacheControl;
-				}
-			} else if (typeof lastMessage.content === "string") {
-				lastMessage.content = [
-					{
-						type: "text",
-						text: lastMessage.content,
-						cache_control: cacheControl,
-					},
-				] as any;
-			}
+		// Apply to the volatile suffix anchor (last user message) — existing behavior.
+		applyCacheControlToParam(params, params.length - 1, cacheControl);
+
+		// Apply to the most recent compaction-boundary message, if any. Capping at
+		// one boundary keeps us safely under Anthropic's 4-breakpoint limit
+		// (system + tools + boundary + last user = 4). If multiple
+		// cacheBreakpoint messages are present, only the most recent one — the
+		// freshest stable boundary — earns the breakpoint. (#5027)
+		const mostRecentBreakpoint = breakpointIndices[breakpointIndices.length - 1];
+		if (mostRecentBreakpoint !== undefined && mostRecentBreakpoint !== params.length - 1) {
+			applyCacheControlToParam(params, mostRecentBreakpoint, cacheControl);
 		}
 	}
 
 	return params;
+}
+
+/** Apply `cache_control` to the last cacheable block of the user-role param at `index`. No-op for non-user roles. */
+function applyCacheControlToParam(
+	params: MessageParam[],
+	index: number,
+	cacheControl: { type: "ephemeral"; ttl?: "1h" },
+): void {
+	const param = params[index];
+	if (!param || param.role !== "user") return;
+	if (Array.isArray(param.content)) {
+		const lastBlock = param.content[param.content.length - 1];
+		if (
+			lastBlock &&
+			(lastBlock.type === "text" || lastBlock.type === "image" || lastBlock.type === "tool_result")
+		) {
+			(lastBlock as any).cache_control = cacheControl;
+		}
+	} else if (typeof param.content === "string") {
+		param.content = [
+			{
+				type: "text",
+				text: param.content,
+				cache_control: cacheControl,
+			},
+		] as any;
+	}
 }
 
 /** Convert GSD tools to Anthropic SDK tool definitions, applying cache control to the last entry. */
@@ -475,11 +501,17 @@ export function buildParams(
 	};
 
 	if (isOAuthToken) {
+		// Only the LAST system block carries `cache_control` — the boundary
+		// covers the entire system prefix up to that point. Putting cache_control
+		// on the short "You are Claude Code" header AND the user systemPrompt
+		// would consume two of Anthropic's 4 breakpoint slots for redundant
+		// coverage, leaving no room for a compaction-summary breakpoint. (#5027)
+		const hasUserSystemPrompt = Boolean(context.systemPrompt);
 		params.system = [
 			{
 				type: "text",
 				text: "You are Claude Code, Anthropic's official CLI for Claude.",
-				...(cacheControl ? { cache_control: cacheControl } : {}),
+				...(cacheControl && !hasUserSystemPrompt ? { cache_control: cacheControl } : {}),
 			},
 		];
 		if (context.systemPrompt) {

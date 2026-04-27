@@ -28,6 +28,12 @@ Plan (with integrated research) → Execute (per task) → Complete → Reassess
 
 Every task, research phase, and planning step gets a clean context window. No accumulated garbage. No degraded quality from context bloat. The dispatch prompt includes everything needed — task plans, prior summaries, dependency context, decisions register — so the LLM starts oriented instead of spending tool calls reading files.
 
+### Runtime Tool Policy
+
+Each auto-mode unit has a `UnitContextManifest` with a `ToolsPolicy`, and GSD enforces that policy before tool calls execute. Execution units use `all` mode and may edit project files, run shell commands, and dispatch subagents. Most planning and discussion units use `planning` mode: they can read broadly, write planning artifacts under `.gsd/`, run only read-only shell commands, and cannot dispatch subagents. Selected planning and closeout units use `planning-dispatch` mode, which keeps the same source-write and bash restrictions but allows `subagent` dispatch for isolated recon, planning, or review work. Documentation units use `docs` mode, which keeps the same restrictions but also allows writes to the manifest's explicit documentation globs such as `docs/**`, top-level `README*.md`, `CHANGELOG.md`, and top-level `*.md`.
+
+Writes outside those allowed paths, unsafe bash commands, and subagent dispatch from non-dispatch planning units are blocked with a hard policy error instead of relying on prompt compliance. In `planning-dispatch` units, prompts steer the parent agent toward read-only specialists such as `scout`, `planner`, `researcher`, `reviewer`, `security`, or `tester`; implementation-tier agents still belong in `execute-task`.
+
 ### Context Pre-Loading
 
 The dispatch prompt is carefully constructed with:
@@ -89,9 +95,15 @@ Commits are generated from task summaries — not generic "complete task" messag
 
 ### Stuck Detection (v2.39)
 
-GSD uses a sliding-window analysis to detect stuck loops. Instead of a simple "same unit dispatched twice" counter, the detector examines recent dispatch history for repeated patterns — catching cycles like A→B→A→B as well as single-unit repeats. On detection, GSD retries once with a deep diagnostic prompt. If it fails again, auto mode stops with the exact file it expected, so you can intervene.
+GSD uses a sliding-window analysis to detect stuck loops. Instead of a simple "same unit dispatched twice" counter, the detector examines recent dispatch history for repeated patterns — catching cycles like A→B→A→B as well as single-unit repeats. On detection, GSD retries once with a deep diagnostic prompt. If it fails again, auto mode stops so you can intervene.
 
 The sliding-window approach reduces false positives on legitimate retries (e.g., verification failures that self-correct) while catching genuine stuck loops faster.
+
+### Artifact Verification Retries
+
+After each unit, GSD verifies that the expected artifact exists on disk. If the artifact is missing, auto mode re-dispatches the unit with explicit failure context and records an `artifact-verification-retry` journal event.
+
+Artifact verification retries are capped at 3 attempts. If the expected artifact is still missing after those retries, GSD pauses auto mode with an "Artifact still missing..." error instead of relying on loop detection or an unbounded dispatch counter.
 
 ### Post-Mortem Investigation (v2.40)
 
@@ -305,14 +317,25 @@ See [Token Optimization](./token-optimization.md) for details.
 
 When enabled, auto-mode automatically selects cheaper models for simple units (slice completion, UAT) and reserves expensive models for complex work (replanning, architectural tasks). See [Dynamic Model Routing](./dynamic-model-routing.md).
 
-## Reactive Task Execution (v2.38)
+## Reactive Task Execution
 
-When `reactive_execution: true` is set in preferences, GSD derives a dependency graph from IO annotations in task plans. Tasks that don't conflict (no shared file reads/writes) are dispatched in parallel via subagents, while dependent tasks wait for their predecessors to complete.
+Reactive task execution is enabled by default. During task execution, GSD derives a dependency graph from the IO annotations in task plans. When at least three ready tasks can be considered safely, tasks that do not conflict (no shared file reads/writes) are dispatched in parallel via subagents, while dependent tasks wait for their predecessors to complete.
 
 ```yaml
-reactive_execution: true    # disabled by default
+reactive_execution:
+  enabled: false    # opt out; omit this block to keep the default-on behavior
 ```
 
-The graph derivation is pure and deterministic — it resolves a ready-set of tasks, detects conflicts, and guards against deadlocks. Verification results carry forward across parallel batches, so tasks that pass verification don't need to be re-verified when subsequent tasks in the same slice complete.
+The graph derivation is pure and deterministic: it resolves a ready-set of tasks, detects conflicts, and guards against deadlocks. If the graph is ambiguous or fewer than the threshold number of ready tasks are available, auto-mode falls back to the normal sequential executor. Setting `reactive_execution.enabled: true` explicitly keeps the earlier opt-in threshold of two ready tasks; omitting the setting uses the safer default-on threshold of three. Verification results carry forward across parallel batches, so tasks that pass verification don't need to be re-verified when subsequent tasks in the same slice complete.
+
+Optional tuning:
+
+```yaml
+reactive_execution:
+  enabled: true              # explicit opt-in threshold: 2 ready tasks
+  max_parallel: 4            # default: 2, allowed range: 1-8
+  isolation_mode: same-tree  # currently the only supported isolation mode
+  subagent_model: claude-sonnet-4-6
+```
 
 The implementation lives in `reactive-graph.ts` (graph derivation, ready-set resolution, conflict/deadlock detection) with integration into `auto-dispatch.ts` and `auto-prompts.ts`.

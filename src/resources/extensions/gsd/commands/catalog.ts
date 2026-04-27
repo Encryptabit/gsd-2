@@ -1,9 +1,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { loadRegistry } from "../workflow-templates.js";
-import { resolveProjectRoot } from "../worktree.js";
 
 const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
 
@@ -15,7 +14,7 @@ export interface GsdCommandDefinition {
 type CompletionMap = Record<string, readonly GsdCommandDefinition[]>;
 
 export const GSD_COMMAND_DESCRIPTION =
-  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|queue|quick|discuss|capture|triage|dispatch|history|undo|undo-task|reset-slice|rate|skip|export|cleanup|model|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|debug|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|parallel|cmux|park|unpark|init|setup|onboarding|inspect|extensions|update|fast|mcp|rethink|codebase|notifications|ship|do|session-report|backlog|pr-branch|add-tests|scan|language";
+  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|queue|quick|discuss|capture|triage|dispatch|history|undo|undo-task|reset-slice|rate|skip|export|cleanup|model|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|debug|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|parallel|cmux|park|unpark|init|setup|onboarding|inspect|extensions|update|fast|mcp|rethink|workflow|codebase|notifications|ship|do|session-report|backlog|pr-branch|add-tests|scan|language|worktree";
 
 export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "help", desc: "Categorized command reference with descriptions" },
@@ -84,6 +83,7 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "add-tests", desc: "Generate tests for completed slices" },
   { cmd: "scan", desc: "Rapid codebase assessment — lightweight alternative to full map (--focus tech|arch|quality|concerns|tech+arch)" },
   { cmd: "language", desc: "Set or clear the global response language (e.g. /gsd language Chinese)" },
+  { cmd: "worktree", desc: "Manage worktrees from the TUI (list, merge, clean, remove)" },
 ];
 
 const NESTED_COMPLETIONS: CompletionMap = {
@@ -300,6 +300,12 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "off",   desc: "Clear the language preference (revert to default)" },
     { cmd: "clear", desc: "Alias for off — clear the language preference" },
   ],
+  worktree: [
+    { cmd: "list",   desc: "Show all worktrees with status" },
+    { cmd: "merge",  desc: "Merge a worktree into main and clean up" },
+    { cmd: "clean",  desc: "Remove all merged/empty worktrees" },
+    { cmd: "remove", desc: "Remove a worktree (--force to skip safety checks)" },
+  ],
 };
 
 function filterOptions(
@@ -344,6 +350,77 @@ function getExtensionCompletions(prefix: string, action: string) {
   } catch {
     return [];
   }
+}
+
+function normalizePathForCompare(path: string): string {
+  return path.replaceAll("\\", "/").replace(/\/+$/, "");
+}
+
+function findWorktreeSegment(normalizedPath: string): { gsdIdx: number; afterWorktrees: number } | null {
+  const directMarker = "/.gsd/worktrees/";
+  const directIdx = normalizedPath.indexOf(directMarker);
+  if (directIdx !== -1) {
+    return { gsdIdx: directIdx, afterWorktrees: directIdx + directMarker.length };
+  }
+
+  const symlinkMatch = normalizedPath.match(/\/\.gsd\/projects\/[a-f0-9]+\/worktrees\//);
+  if (symlinkMatch?.index !== undefined) {
+    return { gsdIdx: symlinkMatch.index, afterWorktrees: symlinkMatch.index + symlinkMatch[0].length };
+  }
+
+  return null;
+}
+
+function resolveProjectRootFromGitFile(worktreePath: string): string | null {
+  try {
+    let dir = worktreePath;
+    for (let i = 0; i < 30; i++) {
+      const gitPath = join(dir, ".git");
+      if (existsSync(gitPath)) {
+        const content = readFileSync(gitPath, "utf8").trim();
+        if (content.startsWith("gitdir: ")) {
+          const gitDir = resolve(dir, content.slice(8));
+          const dotGitDir = resolve(gitDir, "..", "..");
+          if (dotGitDir.endsWith(".git") || dotGitDir.endsWith(".git/") || dotGitDir.endsWith(".git\\")) {
+            return resolve(dotGitDir, "..");
+          }
+          const commonDirPath = join(gitDir, "commondir");
+          if (existsSync(commonDirPath)) {
+            const commonDir = readFileSync(commonDirPath, "utf8").trim();
+            return resolve(resolve(gitDir, commonDir), "..");
+          }
+        }
+        break;
+      }
+      const parent = resolve(dir, "..");
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Completion must stay best-effort.
+  }
+  return null;
+}
+
+function resolveProjectRootForCompletion(basePath: string): string {
+  if (process.env.GSD_PROJECT_ROOT) return process.env.GSD_PROJECT_ROOT;
+
+  const normalizedPath = normalizePathForCompare(basePath);
+  const segment = findWorktreeSegment(normalizedPath);
+  if (!segment) return basePath;
+
+  const separator = basePath.includes("\\") ? "\\" : "/";
+  const gsdMarker = `${separator}.gsd${separator}`;
+  const gsdIdx = basePath.indexOf(gsdMarker);
+  const candidate = gsdIdx !== -1 ? basePath.slice(0, gsdIdx) : basePath.slice(0, segment.gsdIdx);
+
+  const normalizedGsdHome = normalizePathForCompare(gsdHome);
+  const candidateGsdPath = normalizePathForCompare(join(candidate, ".gsd"));
+  if (candidateGsdPath === normalizedGsdHome || candidateGsdPath.startsWith(`${normalizedGsdHome}/`)) {
+    return resolveProjectRootFromGitFile(basePath) ?? basePath;
+  }
+
+  return candidate;
 }
 
 export function getGsdArgumentCompletions(prefix: string) {
@@ -406,7 +483,7 @@ export function getGsdArgumentCompletions(prefix: string) {
   // Workflow definition-name completion for `workflow run <name>` and `workflow validate <name>`
   if (command === "workflow" && (subcommand === "run" || subcommand === "validate") && parts.length <= 3) {
     try {
-      const defsDir = join(resolveProjectRoot(process.cwd()), ".gsd", "workflow-defs");
+      const defsDir = join(resolveProjectRootForCompletion(process.cwd()), ".gsd", "workflow-defs");
       if (existsSync(defsDir)) {
         return readdirSync(defsDir)
           .filter((f) => f.endsWith(".yaml") && f.startsWith(third))
@@ -443,7 +520,7 @@ export function getGsdArgumentCompletions(prefix: string) {
       } catch { /* ignore */ }
     };
     try {
-      const base = resolveProjectRoot(process.cwd());
+      const base = resolveProjectRootForCompletion(process.cwd());
       scanDir(join(base, ".gsd", "workflows"), "project");
       scanDir(join(base, ".gsd", "workflow-defs"), "project-legacy");
       scanDir(join(gsdHome, "workflows"), "global");

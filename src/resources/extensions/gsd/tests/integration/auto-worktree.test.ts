@@ -7,7 +7,7 @@
 
 import { describe, test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -21,6 +21,7 @@ import {
   getAutoWorktreeOriginalBase,
   getActiveAutoWorktreeContext,
   syncGsdStateToWorktree,
+  _resetAutoWorktreeOriginalBaseForTests,
 } from "../../auto-worktree.ts";
 
 // Note: execSync is used intentionally in tests for git operations with
@@ -140,6 +141,54 @@ describe("auto-worktree lifecycle", () => {
 
     // Cleanup
     teardownAutoWorktree(tempDir, "M003");
+  });
+
+  test("symlink-resolved auto worktree is detected after module state reset", () => {
+    tempDir = createTempRepo();
+    const savedGsdHome = process.env.GSD_HOME;
+    const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "auto-wt-home-")));
+    const storage = join(fakeHome, ".gsd", "projects", "abc123def456");
+    mkdirSync(join(storage, "milestones", "M001"), { recursive: true });
+    writeFileSync(join(storage, "milestones", "M001", "CONTEXT.md"), "# M001\n");
+    symlinkSync(storage, join(tempDir, ".gsd"));
+    process.env.GSD_HOME = join(fakeHome, ".gsd");
+
+    try {
+      const wtPath = createAutoWorktree(tempDir, "M001");
+      const realWtPath = realpathSync(wtPath);
+      assert.ok(realWtPath.startsWith(storage), "git registered the symlink-resolved worktree path");
+
+      _resetAutoWorktreeOriginalBaseForTests();
+      process.chdir(join(realWtPath, ".gsd", "milestones", "M001"));
+
+      assert.ok(isInAutoWorktree(tempDir), "structural detection works without module originalBase");
+      const resolved = getAutoWorktreePath(realWtPath, "M001");
+      assert.ok(resolved, "existing worktree is found when basePath is the worktree path");
+      assert.equal(realpathSync(resolved!), realWtPath);
+      assert.equal(existsSync(join(realWtPath, ".gsd", "worktrees", "M001")), false);
+
+      enterAutoWorktree(tempDir, "M001");
+      process.chdir(join(realWtPath, ".gsd", "milestones", "M001"));
+      assert.deepStrictEqual(
+        getActiveAutoWorktreeContext(),
+        {
+          originalBase: tempDir,
+          worktreeName: "M001",
+          branch: "milestone/M001",
+        },
+        "active context is detected from a symlink-resolved worktree cwd",
+      );
+    } finally {
+      process.chdir(tempDir);
+      try {
+        teardownAutoWorktree(tempDir, "M001");
+      } catch {
+        // Best-effort cleanup for partially-created temp worktrees.
+      }
+      if (savedGsdHome === undefined) delete process.env.GSD_HOME;
+      else process.env.GSD_HOME = savedGsdHome;
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 
   test("coexistence with manual worktree", async () => {
@@ -344,5 +393,27 @@ describe("auto-worktree lifecycle", () => {
     } finally {
       teardownAutoWorktree(tempDir, "M003");
     }
+  });
+
+  test("#2482: throws GSDError when repo has no commits", () => {
+    // Create a bare git init with no commits — HEAD is invalid
+    tempDir = realpathSync(mkdtempSync(join(tmpdir(), "auto-wt-empty-")));
+    run("git init", tempDir);
+    run("git config user.email test@test.com", tempDir);
+    run("git config user.name Test", tempDir);
+
+    assert.throws(
+      () => createAutoWorktree(tempDir, "M001"),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, "should throw an Error");
+        assert.ok("code" in err, "should have a code property (GSDError)");
+        assert.strictEqual((err as { code: string }).code, "GSD_GIT_ERROR");
+        assert.ok(
+          err.message.includes("repository has no commits yet"),
+          `message should mention no commits, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
   });
 });

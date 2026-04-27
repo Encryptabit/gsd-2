@@ -35,6 +35,39 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/**
+	 * Optional predicate applied to the `skills` list before rendering the
+	 * <available_skills> catalog. Returning `false` omits a skill from the
+	 * prompt (the skill remains loaded and invocable by name — only the
+	 * catalog listing is suppressed).
+	 *
+	 * Intended for consumers that can narrow the relevant skill surface
+	 * (e.g. per-unit-type manifests) to reduce cached system-prompt bloat.
+	 * When omitted, all non-`disableModelInvocation` skills render — i.e.
+	 * behavior is unchanged from before this option existed.
+	 *
+	 * Contract: the predicate must be **pure and synchronous**. It may be
+	 * invoked on every system-prompt rebuild (tool-set changes and
+	 * runtime resource-loader extensions both trigger one), so any state
+	 * the closure captures should be stable across the rebuild window.
+	 * If the predicate throws, `buildSystemPrompt` logs a warning and
+	 * falls back to the unfiltered skill list — callers never see the
+	 * exception and the session stays consistent.
+	 */
+	skillFilter?: (skill: Skill) => boolean;
+	/**
+	 * Append a `Current date and time: <toLocaleString>` line to the system
+	 * prompt. Default: `false`.
+	 *
+	 * Anthropic prompt caching matches on byte-for-byte prefix equality.
+	 * Embedding a per-call timestamp in the system prompt invalidates the
+	 * cache on every request, forcing a full re-write that costs *more*
+	 * than an uncached call (cache-write premium). Most agentic flows do
+	 * not need wall-clock awareness in the system prompt — opt in only
+	 * when the consumer genuinely needs it (e.g. a clock-sensitive agent),
+	 * and inject it via a non-cached channel (user message) when possible.
+	 */
+	includeDateTime?: boolean;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -48,25 +81,44 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
+		skillFilter,
+		includeDateTime = false,
 	} = options;
 	const resolvedCwd = toPosixPath(cwd ?? process.cwd());
 
-	const now = new Date();
-	const dateTime = now.toLocaleString("en-US", {
-		weekday: "long",
-		year: "numeric",
-		month: "long",
-		day: "numeric",
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-		timeZoneName: "short",
-	});
+	// Per-call timestamps invalidate Anthropic prompt caching (the cache
+	// matches on byte-for-byte prefix equality). Compute lazily and only
+	// when explicitly opted in via `includeDateTime`.
+	const dateTimeLine = includeDateTime
+		? `\nCurrent date and time: ${new Date().toLocaleString("en-US", {
+			weekday: "long",
+			year: "numeric",
+			month: "long",
+			day: "numeric",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+			timeZoneName: "short",
+		})}`
+		: "";
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 
 	const contextFiles = providedContextFiles ?? [];
-	const skills = providedSkills ?? [];
+	const skillsBase = providedSkills ?? [];
+	let skills = skillsBase;
+	if (skillFilter) {
+		try {
+			skills = skillsBase.filter(skillFilter);
+		} catch (error) {
+			// A consumer's predicate threw. Fall back to the unfiltered list so
+			// the session stays consistent — callers (e.g. AgentSession.setTools)
+			// must not be left with updated tools but a stale system prompt.
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(`buildSystemPrompt: skillFilter threw; falling back to unfiltered skills. Error: ${message}`);
+			skills = skillsBase;
+		}
+	}
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -90,8 +142,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 			prompt += formatSkillsForPrompt(skills);
 		}
 
-		// Add date/time and working directory last
-		prompt += `\nCurrent date and time: ${dateTime}`;
+		// Add date/time (only when opted in — see includeDateTime docs) and working directory last
+		prompt += dateTimeLine;
 		prompt += `\nCurrent working directory: ${resolvedCwd}`;
 
 		// Append promptGuidelines from extension-registered tools.
@@ -238,8 +290,8 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 		prompt += formatSkillsForPrompt(skills);
 	}
 
-	// Add date/time and working directory last
-	prompt += `\nCurrent date and time: ${dateTime}`;
+	// Add date/time (only when opted in — see includeDateTime docs) and working directory last
+	prompt += dateTimeLine;
 	prompt += `\nCurrent working directory: ${resolvedCwd}`;
 
 	return prompt;

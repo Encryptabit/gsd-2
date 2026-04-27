@@ -84,6 +84,102 @@ describe("getModelCapabilities", () => {
 	});
 });
 
+// ─── Ordering / prefix-shadowing regression (#4991) ──────────────────────────
+//
+// The lookup is a linear scan over KNOWN_MODELS using `baseName.startsWith(pattern)`.
+// Cloud and long-variant model names share prefixes with their base families,
+// so the longer entries MUST appear earlier in the table — otherwise a base
+// like `qwen3` shadows `qwen3-coder`/`qwen3-next`/`qwen3.5` and the picker
+// reports the wrong context window. These tests pin the ordering.
+
+describe("getModelCapabilities — long-variant overrides aren't shadowed (#4991)", () => {
+	it("qwen3-coder reports 256K, not the qwen3 131K", () => {
+		const caps = getModelCapabilities("qwen3-coder:480b");
+		assert.equal(caps.contextWindow, 262144);
+		assert.equal(caps.ollamaOptions?.num_ctx, 262144);
+	});
+
+	it("qwen3-coder-next still resolves via the qwen3-coder entry", () => {
+		const caps = getModelCapabilities("qwen3-coder-next");
+		assert.equal(caps.contextWindow, 262144);
+	});
+
+	it("qwen3-next:80b reports 1M, not the qwen3 131K", () => {
+		const caps = getModelCapabilities("qwen3-next:80b");
+		assert.equal(caps.contextWindow, 1048576);
+	});
+
+	it("qwen3.5 / qwen3.6 cloud variants report 1M", () => {
+		assert.equal(getModelCapabilities("qwen3.5:397b").contextWindow, 1048576);
+		assert.equal(getModelCapabilities("qwen3.6:cloud").contextWindow, 1048576);
+	});
+
+	it("base qwen3 still resolves to its 131K entry", () => {
+		const caps = getModelCapabilities("qwen3:8b");
+		assert.equal(caps.contextWindow, 131072);
+	});
+
+	it("glm-5.1:cloud reports 200K", () => {
+		const caps = getModelCapabilities("glm-5.1:cloud");
+		assert.equal(caps.contextWindow, 204800);
+	});
+
+	it("glm-4.6:cloud reports 200K", () => {
+		const caps = getModelCapabilities("glm-4.6:cloud");
+		assert.equal(caps.contextWindow, 204800);
+	});
+
+	it("glm-4 base still resolves to its 131K entry", () => {
+		const caps = getModelCapabilities("glm-4:9b");
+		assert.equal(caps.contextWindow, 131072);
+	});
+
+	it("kimi-k2-thinking reports 256K (not shadowed by kimi-k2)", () => {
+		const caps = getModelCapabilities("kimi-k2-thinking");
+		assert.equal(caps.contextWindow, 262144);
+	});
+
+	it("kimi-k2.5:cloud and kimi-k2.6:cloud both report 256K", () => {
+		assert.equal(getModelCapabilities("kimi-k2.5:cloud").contextWindow, 262144);
+		assert.equal(getModelCapabilities("kimi-k2.6:cloud").contextWindow, 262144);
+	});
+
+	it("kimi-k2 base resolves to 256K", () => {
+		const caps = getModelCapabilities("kimi-k2:cloud");
+		assert.equal(caps.contextWindow, 262144);
+	});
+
+	it("minimax-m2.5:cloud and minimax-m2.7:cloud report 1M", () => {
+		assert.equal(getModelCapabilities("minimax-m2.5:cloud").contextWindow, 1048576);
+		assert.equal(getModelCapabilities("minimax-m2.7:cloud").contextWindow, 1048576);
+	});
+
+	it("minimax-m2 base resolves to 1M", () => {
+		const caps = getModelCapabilities("minimax-m2:cloud");
+		assert.equal(caps.contextWindow, 1048576);
+	});
+
+	it("ollamaOptions.num_ctx mirrors contextWindow for all new entries", () => {
+		// Inference time: num_ctx is what gets sent to Ollama on each chat.
+		// If contextWindow is right but num_ctx is stale, the model still
+		// gets truncated. Pin both sides.
+		for (const name of [
+			"qwen3-next:80b",
+			"qwen3-coder:480b",
+			"glm-5.1:cloud",
+			"kimi-k2-thinking",
+			"minimax-m2.7:cloud",
+		]) {
+			const caps = getModelCapabilities(name);
+			assert.equal(
+				caps.ollamaOptions?.num_ctx,
+				caps.contextWindow,
+				`${name}: num_ctx (${caps.ollamaOptions?.num_ctx}) must equal contextWindow (${caps.contextWindow})`,
+			);
+		}
+	});
+});
+
 // ─── estimateContextFromParams ───────────────────────────────────────────────
 
 describe("estimateContextFromParams", () => {

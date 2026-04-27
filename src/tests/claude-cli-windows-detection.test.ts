@@ -29,6 +29,16 @@ const WINDOWS_CLAUDE_SELECTOR =
 	/process\.platform\s*===\s*['"]win32['"]\s*\?\s*['"]claude\.cmd['"]\s*:\s*['"]claude['"]/;
 
 /**
+ * After Issue #5017 the binary is invoked via `cmd /c <command> <args...>`
+ * on Windows instead of `execFileSync(command, args, { shell: true })` —
+ * the latter triggers Node 22+'s DEP0190 deprecation warning. The
+ * assertion guards the explicit cmd.exe invocation so a future refactor
+ * can't silently re-introduce the deprecated pattern.
+ */
+const WINDOWS_CMD_SHELL_GUARD =
+	/execFileSync\(\s*["']cmd["']\s*,\s*\[\s*["']\/c["']/;
+
+/**
  * Verifies the onboarding-level readiness check (`claude-cli-check.ts`)
  * carries the `process.platform === 'win32' ? 'claude.cmd' : 'claude'`
  * selector used by `execFileSync`. Guards the wizard path from Issue
@@ -44,6 +54,12 @@ function verifyCliCheckSelector(): void {
 		source,
 		WINDOWS_CLAUDE_SELECTOR,
 		"claude-cli-check.ts must implement process.platform === 'win32' ? 'claude.cmd' : 'claude'",
+	);
+
+	assert.match(
+		source,
+		WINDOWS_CMD_SHELL_GUARD,
+		"claude-cli-check.ts must invoke claude via 'cmd /c' on Windows (Issue #5017 — avoids DEP0190)",
 	);
 }
 
@@ -69,6 +85,12 @@ function verifyReadinessSelector(): void {
 		source,
 		WINDOWS_CLAUDE_SELECTOR,
 		"readiness.ts must implement process.platform === 'win32' ? 'claude.cmd' : 'claude'",
+	);
+
+	assert.match(
+		source,
+		WINDOWS_CMD_SHELL_GUARD,
+		"readiness.ts must invoke claude via 'cmd /c' on Windows (Issue #5017 — avoids DEP0190)",
 	);
 }
 

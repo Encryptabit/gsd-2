@@ -7,6 +7,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 
+import { logAliasUsage } from "./alias-telemetry.js";
+
 type WorkflowToolExecutors = {
   SUPPORTED_SUMMARY_ARTIFACT_TYPES: readonly string[];
   executeMilestoneStatus: (params: { milestoneId: string }, basePath?: string) => Promise<unknown>;
@@ -847,6 +849,80 @@ async function ensureMilestoneDbRow(milestoneId: string): Promise<void> {
   }
 }
 
+async function findDatabaseMilestoneIds(): Promise<string[]> {
+  try {
+    const { getAllMilestones } = await importLocalModule<any>("../../../src/resources/extensions/gsd/gsd-db.js");
+    return (getAllMilestones?.() ?? [])
+      .map((milestone: unknown) => {
+        const id = (milestone as { id?: unknown })?.id;
+        return typeof id === "string" ? id : null;
+      })
+      .filter((id: string | null): id is string => id !== null);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fix #4996: Shared helper for both gsd_milestone_generate_id and
+ * gsd_generate_milestone_id. Reuses the lowest reusable ghost milestone ID
+ * (a disk-only stub with no DB row, no worktree, no content files) before
+ * falling back to max+1. Uses the stricter `isReusableGhostMilestone` —
+ * not `isGhostMilestone` — to avoid racing with in-flight queued DB rows
+ * from an earlier call to this same tool.
+ */
+async function generateOrReuseMilestoneId(projectDir: string): Promise<string> {
+  const {
+    claimReservedId,
+    findMilestoneIds,
+    getReservedMilestoneIds,
+    nextMilestoneId,
+    milestoneIdSort,
+  } = await importLocalModule<any>("../../../src/resources/extensions/gsd/milestone-ids.js");
+
+  const reserved = claimReservedId();
+  if (reserved) {
+    await ensureMilestoneDbRow(reserved);
+    return reserved;
+  }
+
+  const allIds = [
+    ...new Set([
+      ...findMilestoneIds(projectDir),
+      ...getReservedMilestoneIds(),
+      ...(await findDatabaseMilestoneIds()),
+    ]),
+  ];
+
+  // Attempt ghost-ID reuse before falling back to max+1.
+  const { isReusableGhostMilestone } = await importLocalModule<any>(
+    "../../../src/resources/extensions/gsd/state.js",
+  );
+  const sorted = [...allIds].sort(milestoneIdSort);
+  for (const candidate of sorted) {
+    if (isReusableGhostMilestone(projectDir, candidate)) {
+      await ensureMilestoneDbRow(candidate);
+      return candidate;
+    }
+  }
+
+  const prefsMod = await importLocalModule<any>(
+    "../../../src/resources/extensions/gsd/preferences.js",
+  ).catch(() => null);
+  // Graceful degradation: a corrupt preferences file should not crash
+  // milestone-id generation. Fall back to non-unique IDs if anything
+  // throws here — matches the pre-fix behavior for missing prefs.
+  let uniqueEnabled = false;
+  try {
+    uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.(projectDir)?.preferences?.unique_milestone_ids;
+  } catch {
+    uniqueEnabled = false;
+  }
+  const nextId = nextMilestoneId(allIds, uniqueEnabled);
+  await ensureMilestoneDbRow(nextId);
+  return nextId;
+}
+
 // projectDir is optional. When omitted, the server uses process.cwd(). This
 // prevents the agent from burning tokens reasoning about which absolute path
 // to pass (git root vs worktree vs symlink-resolved external state layout) —
@@ -875,6 +951,17 @@ const nonEmptyStringArray = (field: string) =>
 // empty/whitespace fields at parse time. Without this, MCP callers pass "" for
 // the heavy planning fields, Zod accepts it, and the executor rejects one
 // field per call — forcing the agent into a retry loop to discover every gap.
+//
+// #4759 follow-up: the four heavy fields are Zod-optional because sketch
+// slices (isSketch=true) legitimately omit them, but they are REQUIRED for
+// every other slice. The conditional requirement is invisible in the JSON
+// Schema `required` array, so callers can only discover it from the
+// descriptions or by hitting the runtime superRefine below. The `.describe()`
+// calls below make that contract unmistakable in the tool schema sent to
+// agents; the superRefine enforces it at parse time.
+const HEAVY_FIELD_DESCRIBE = (field: string) =>
+  `${field} for this slice. REQUIRED unless isSketch=true (sketch slices defer this to refine-slice).`;
+
 const planMilestoneSliceSchema = z.object({
   sliceId: nonEmptyString("sliceId"),
   title: nonEmptyString("title"),
@@ -883,14 +970,16 @@ const planMilestoneSliceSchema = z.object({
   demo: nonEmptyString("demo"),
   goal: nonEmptyString("goal"),
   // ADR-011: heavy planning fields are optional for sketch slices; required for full slices.
-  successCriteria: z.string().optional(),
-  proofLevel: z.string().optional(),
-  integrationClosure: z.string().optional(),
-  observabilityImpact: z.string().optional(),
+  successCriteria: z.string().optional().describe(HEAVY_FIELD_DESCRIBE("successCriteria")),
+  proofLevel: z.string().optional().describe(HEAVY_FIELD_DESCRIBE("proofLevel")),
+  integrationClosure: z.string().optional().describe(HEAVY_FIELD_DESCRIBE("integrationClosure")),
+  observabilityImpact: z.string().optional().describe(HEAVY_FIELD_DESCRIBE("observabilityImpact")),
   // ADR-011 sketch-then-refine fields.
-  isSketch: z.boolean().optional().describe("ADR-011: true marks this slice as a sketch awaiting refine-slice expansion"),
+  isSketch: z.boolean().optional().describe("ADR-011: true marks this slice as a sketch awaiting refine-slice expansion. When true, successCriteria/proofLevel/integrationClosure/observabilityImpact may be omitted and sketchScope becomes required."),
   sketchScope: z.string().optional().describe("ADR-011: 2-3 sentence scope boundary, required when isSketch=true"),
-}).superRefine((slice, ctx) => {
+}).describe(
+  "Planned slice. For full slices (isSketch omitted or false): successCriteria, proofLevel, integrationClosure, and observabilityImpact are all required. For sketch slices (isSketch=true): those four fields may be omitted, but sketchScope is required.",
+).superRefine((slice, ctx) => {
   if (slice.isSketch === true) {
     if (typeof slice.sketchScope !== "string" || slice.sketchScope.trim().length === 0) {
       ctx.addIssue({
@@ -1253,6 +1342,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_decision_save. Record a project decision to the GSD database and regenerate DECISIONS.md.",
     decisionSaveParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_save_decision", "gsd_decision_save");
       const parsed = parseWorkflowArgs(decisionSaveSchema, args);
       const { projectDir, ...params } = parsed;
       await enforceWorkflowWriteGate("gsd_decision_save", projectDir);
@@ -1285,6 +1375,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_requirement_update. Update an existing requirement in the GSD database and regenerate REQUIREMENTS.md.",
     requirementUpdateParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_update_requirement", "gsd_requirement_update");
       const parsed = parseWorkflowArgs(requirementUpdateSchema, args);
       const { projectDir, id, ...updates } = parsed;
       await enforceWorkflowWriteGate("gsd_requirement_update", projectDir);
@@ -1317,6 +1408,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_requirement_save. Record a new requirement to the GSD database and regenerate REQUIREMENTS.md.",
     requirementSaveParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_save_requirement", "gsd_requirement_save");
       const parsed = parseWorkflowArgs(requirementSaveSchema, args);
       const { projectDir, ...params } = parsed;
       await enforceWorkflowWriteGate("gsd_requirement_save", projectDir);
@@ -1335,35 +1427,9 @@ export function registerWorkflowTools(server: McpToolServer): void {
     async (args: Record<string, unknown>) => {
       const { projectDir } = parseWorkflowArgs(milestoneGenerateIdSchema, args);
       await enforceWorkflowWriteGate("gsd_milestone_generate_id", projectDir);
-      const id = await runSerializedWorkflowDbOperation(projectDir, async () => {
-        const {
-          claimReservedId,
-          findMilestoneIds,
-          getReservedMilestoneIds,
-          nextMilestoneId,
-        } = await importLocalModule<any>("../../../src/resources/extensions/gsd/milestone-ids.js");
-        const reserved = claimReservedId();
-        if (reserved) {
-          await ensureMilestoneDbRow(reserved);
-          return reserved;
-        }
-        const allIds = [...new Set([...findMilestoneIds(projectDir), ...getReservedMilestoneIds()])];
-        const prefsMod = await importLocalModule<any>(
-          "../../../src/resources/extensions/gsd/preferences.js",
-        ).catch(() => null);
-        // Graceful degradation: a corrupt preferences file should not crash
-        // milestone-id generation. Fall back to non-unique IDs if anything
-        // throws here — matches the pre-fix behavior for missing prefs.
-        let uniqueEnabled = false;
-        try {
-          uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
-        } catch {
-          uniqueEnabled = false;
-        }
-        const nextId = nextMilestoneId(allIds, uniqueEnabled);
-        await ensureMilestoneDbRow(nextId);
-        return nextId;
-      });
+      const id = await runSerializedWorkflowDbOperation(projectDir, () =>
+        generateOrReuseMilestoneId(projectDir),
+      );
       return { content: [{ type: "text" as const, text: id }] };
     },
   );
@@ -1373,37 +1439,12 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_milestone_generate_id. Generate the next milestone ID for a new GSD milestone.",
     milestoneGenerateIdParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_generate_milestone_id", "gsd_milestone_generate_id");
       const { projectDir } = parseWorkflowArgs(milestoneGenerateIdSchema, args);
       await enforceWorkflowWriteGate("gsd_milestone_generate_id", projectDir);
-      const id = await runSerializedWorkflowDbOperation(projectDir, async () => {
-        const {
-          claimReservedId,
-          findMilestoneIds,
-          getReservedMilestoneIds,
-          nextMilestoneId,
-        } = await importLocalModule<any>("../../../src/resources/extensions/gsd/milestone-ids.js");
-        const reserved = claimReservedId();
-        if (reserved) {
-          await ensureMilestoneDbRow(reserved);
-          return reserved;
-        }
-        const allIds = [...new Set([...findMilestoneIds(projectDir), ...getReservedMilestoneIds()])];
-        const prefsMod = await importLocalModule<any>(
-          "../../../src/resources/extensions/gsd/preferences.js",
-        ).catch(() => null);
-        // Graceful degradation: a corrupt preferences file should not crash
-        // milestone-id generation. Fall back to non-unique IDs if anything
-        // throws here — matches the pre-fix behavior for missing prefs.
-        let uniqueEnabled = false;
-        try {
-          uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
-        } catch {
-          uniqueEnabled = false;
-        }
-        const nextId = nextMilestoneId(allIds, uniqueEnabled);
-        await ensureMilestoneDbRow(nextId);
-        return nextId;
-      });
+      const id = await runSerializedWorkflowDbOperation(projectDir, () =>
+        generateOrReuseMilestoneId(projectDir),
+      );
       return { content: [{ type: "text" as const, text: id }] };
     },
   );
@@ -1464,6 +1505,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_plan_task. Write task planning state to the GSD database and render tasks/T##-PLAN.md from DB.",
     planTaskParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_task_plan", "gsd_plan_task");
       const parsed = parseWorkflowArgs(planTaskSchema, args);
       const { projectDir, ...params } = parsed;
       await enforceWorkflowWriteGate("gsd_plan_task", projectDir, params.milestoneId);
@@ -1495,6 +1537,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_replan_slice. Replan a slice after a blocker is discovered.",
     replanSliceParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_slice_replan", "gsd_replan_slice");
       const parsed = parseWorkflowArgs(replanSliceSchema, args);
       return handleReplanSlice(parsed.projectDir, parsed);
     },
@@ -1515,6 +1558,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_slice_complete. Record a completed slice to the GSD database and render summary/UAT artifacts.",
     sliceCompleteParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_complete_slice", "gsd_slice_complete");
       const parsed = parseWorkflowArgs(sliceCompleteSchema, args);
       return handleSliceComplete(parsed.projectDir, parsed);
     },
@@ -1565,6 +1609,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_complete_milestone. Record a completed milestone to the GSD database and render its SUMMARY.md.",
     completeMilestoneParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_milestone_complete", "gsd_complete_milestone");
       const parsed = parseWorkflowArgs(completeMilestoneSchema, args);
       return handleCompleteMilestone(parsed.projectDir, parsed);
     },
@@ -1585,6 +1630,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_validate_milestone. Validate a milestone and render VALIDATION.md.",
     validateMilestoneParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_milestone_validate", "gsd_validate_milestone");
       const parsed = parseWorkflowArgs(validateMilestoneSchema, args);
       return handleValidateMilestone(parsed.projectDir, parsed);
     },
@@ -1605,6 +1651,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_reassess_roadmap. Reassess a roadmap after slice completion.",
     reassessRoadmapParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_roadmap_reassess", "gsd_reassess_roadmap");
       const parsed = parseWorkflowArgs(reassessRoadmapSchema, args);
       return handleReassessRoadmap(parsed.projectDir, parsed);
     },
@@ -1659,6 +1706,7 @@ export function registerWorkflowTools(server: McpToolServer): void {
     "Alias for gsd_task_complete. Record a completed task to the GSD database and render its SUMMARY.md.",
     taskCompleteParams,
     async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_complete_task", "gsd_task_complete");
       const parsed = parseWorkflowArgs(taskCompleteSchema, args);
       const { projectDir, ...taskArgs } = parsed;
       return handleTaskComplete(projectDir, taskArgs);

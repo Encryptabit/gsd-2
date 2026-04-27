@@ -15,6 +15,7 @@ import { resolve, join, dirname } from "node:path";
 import { gsdRoot } from "../paths.js";
 import { fileURLToPath } from "node:url";
 import { showNextAction } from "../../shared/tui.js";
+import { getHomeDir } from "../home-dir.js";
 import {
   validatePlanningDirectory,
   parsePlanningDirectory,
@@ -85,9 +86,9 @@ export async function handleMigrate(
   // Default to cwd when no args given; expand ~ to HOME
   let rawPath = args.trim() || ".";
   if (rawPath.startsWith("~/")) {
-    rawPath = join(process.env.HOME ?? "~", rawPath.slice(2));
+    rawPath = join(getHomeDir(), rawPath.slice(2));
   } else if (rawPath === "~") {
-    rawPath = process.env.HOME ?? "~";
+    rawPath = getHomeDir();
   }
 
   let sourcePath = resolve(process.cwd(), rawPath);

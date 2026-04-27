@@ -207,6 +207,10 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
 						],
 						timestamp: m.timestamp,
+						// Stable point in the conversation — earn prompt-cache reads on the
+						// summary + kept history block on every post-compaction turn until
+						// the next compaction. (#5027)
+						cacheBreakpoint: true,
 					};
 				case "user":
 				case "assistant":

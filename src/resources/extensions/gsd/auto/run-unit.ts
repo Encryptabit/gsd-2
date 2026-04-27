@@ -9,7 +9,11 @@ import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 import type { AutoSession } from "./session.js";
 import { NEW_SESSION_TIMEOUT_MS } from "./session.js";
 import type { UnitResult } from "./types.js";
-import { _setCurrentResolve, _setSessionSwitchInFlight } from "./resolve.js";
+import { _clearCurrentResolve, _setCurrentResolve, _setSessionSwitchInFlight } from "./resolve.js";
+import {
+  getCurrentTurnGeneration,
+  runWithTurnGeneration,
+} from "./turn-epoch.js";
 import { debugLog } from "../debug-logger.js";
 import { logWarning, logError } from "../workflow-logger.js";
 import { resolveAutoSupervisorConfig } from "../preferences.js";
@@ -35,6 +39,29 @@ export async function runUnit(
   prompt: string,
 ): Promise<UnitResult> {
   debugLog("runUnit", { phase: "start", unitType, unitId });
+
+  // Ensure cwd matches basePath BEFORE newSession() captures it. The new
+  // session reads process.cwd() during construction to anchor its tool
+  // runtime and system prompt; if cwd has drifted (async_bash, background
+  // jobs, prior unit cleanup), the session would otherwise be rooted to
+  // the wrong directory. Must be synchronous — no awaits between chdir
+  // and newSession (#1389, #4762 follow-up).
+  try {
+    if (process.cwd() !== s.basePath) {
+      process.chdir(s.basePath);
+    }
+  } catch (e) {
+    const msg = `Failed to chdir to basePath before newSession (basePath: ${s.basePath}): ${String(e)}`;
+    logWarning("engine", msg, { basePath: s.basePath, error: String(e) });
+    return {
+      status: "cancelled",
+      errorContext: {
+        message: msg,
+        category: "session-failed",
+        isTransient: true,
+      },
+    };
+  }
 
   // ── Session creation with timeout ──
   debugLog("runUnit", { phase: "session-create", unitType, unitId });
@@ -116,17 +143,6 @@ export async function runUnit(
     _setCurrentResolve(resolve);
   });
 
-  // Ensure cwd matches basePath before dispatch (#1389).
-  // async_bash and background jobs can drift cwd away from the worktree.
-  // Realigning here prevents commits from landing on the wrong branch.
-  try {
-    if (process.cwd() !== s.basePath) {
-      process.chdir(s.basePath);
-    }
-  } catch (e) {
-    logWarning("engine", "Failed to chdir to basePath before dispatch", { basePath: s.basePath, error: String(e) });
-  }
-
   // ── Provider request-readiness pre-check (#4555) ──
   // Verify the provider can accept requests before dispatching. If the token
   // has expired since bootstrap, return cancelled immediately so the unit is
@@ -144,6 +160,7 @@ export async function runUnit(
       }
 
       if (!ready) {
+        _clearCurrentResolve();
         return {
           status: "cancelled",
           errorContext: {
@@ -156,9 +173,17 @@ export async function runUnit(
     }
   }
 
+  // ── Capture turn generation for stale-write detection ──
+  // Any write site reached via the sendMessage → tool-call → await chain
+  // below sees this generation via AsyncLocalStorage. If a timeout recovery
+  // or cancellation bumps the generation while this turn is in flight, those
+  // writes see themselves as stale and self-drop.
+  const capturedTurnGen = getCurrentTurnGeneration();
+
   // ── Send the prompt ──
   debugLog("runUnit", { phase: "send-message", unitType, unitId });
 
+  const requestDispatchedAt = Date.now();
   pi.sendMessage(
     { customType: "gsd-auto", content: prompt, display: s.verbose },
     { triggerTurn: true },
@@ -179,7 +204,9 @@ export async function runUnit(
       resolve({ status: "cancelled", errorContext: { message: "Unit hard timeout — supervision may have failed", category: "timeout", isTransient: true } });
     }, UNIT_HARD_TIMEOUT_MS);
   });
-  const result = await Promise.race([unitPromise, timeoutResult]);
+  const result = await runWithTurnGeneration(capturedTurnGen, () =>
+    Promise.race([unitPromise, timeoutResult]),
+  );
   if (unitTimeoutHandle) clearTimeout(unitTimeoutHandle);
   debugLog("runUnit", {
     phase: "agent-end-received",
@@ -187,6 +214,7 @@ export async function runUnit(
     unitId,
     status: result.status,
   });
+  const finalResult: UnitResult = { ...result, requestDispatchedAt };
 
   // Discard trailing follow-up messages (e.g. async_job_result notifications)
   // from the completed unit. Without this, queued follow-ups trigger wasteful
@@ -202,5 +230,5 @@ export async function runUnit(
     logWarning("engine", "clearQueue failed after unit completion", { error: String(e) });
   }
 
-  return result;
+  return finalResult;
 }

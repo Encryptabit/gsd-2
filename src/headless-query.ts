@@ -19,19 +19,59 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import type { GSDState } from './resources/extensions/gsd/types.js'
-import { resolveBundledSourceResource } from './bundled-resource-path.js'
+import { resolveBundledGsdExtensionModule } from './bundled-resource-path.js'
 
 const jiti = createJiti(fileURLToPath(import.meta.url), { interopDefault: true, debug: false })
-// Resolve extensions from the synced agent directory so headless-query
-// loads the same extension copy as interactive/auto modes (#3471).
-// Falls back to bundled source for source-tree dev workflows.
-const agentExtensionsDir = join(process.env.GSD_AGENT_DIR || join(homedir(), '.gsd', 'agent'), 'extensions', 'gsd')
 const { existsSync } = await import('node:fs')
-const useAgentDir = existsSync(join(agentExtensionsDir, 'state.ts'))
+
+/**
+ * Resolve the GSD extensions root for headless-query. Prefers the synced
+ * agent directory (so headless-query loads the same extension copy as
+ * interactive/auto modes — #3471) and falls back to the bundled source
+ * resource for source-tree dev workflows.
+ *
+ * Pure on the given inputs (env + fs probe + bundled resolver) so the
+ * #3471 contract can be exercised in tests without spawning a subprocess.
+ */
+export function resolveGsdAgentExtensionsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const agentRoot = env.GSD_AGENT_DIR || join(env.GSD_HOME || join(homedir(), '.gsd'), 'agent')
+  return join(agentRoot, 'extensions', 'gsd')
+}
+
+/**
+ * Decide whether headless-query should load extensions from the agent
+ * sync directory (#3471) or fall back to bundled source. Returns the
+ * agent dir alongside the decision so a caller can use it directly.
+ */
+export function shouldUseAgentExtensionsDir(opts: {
+  env?: NodeJS.ProcessEnv
+  fileExists?: (path: string) => boolean
+}): { agentDir: string; useAgentDir: boolean } {
+  const env = opts.env ?? process.env
+  const fileExists = opts.fileExists ?? existsSync
+  const agentDir = resolveGsdAgentExtensionsDir(env)
+  return {
+    agentDir,
+    useAgentDir: fileExists(join(agentDir, 'state.ts')) || fileExists(join(agentDir, 'state.js')),
+  }
+}
+
+const agentExtensionsDir = resolveGsdAgentExtensionsDir()
+const { useAgentDir } = shouldUseAgentExtensionsDir({ env: process.env })
 const gsdExtensionPath = (...segments: string[]) =>
   useAgentDir
-    ? join(agentExtensionsDir, ...segments)
-    : resolveBundledSourceResource(import.meta.url, 'extensions', 'gsd', ...segments)
+    ? resolveAgentExtensionModule(agentExtensionsDir, segments)
+    : resolveBundledGsdExtensionModule(import.meta.url, segments.join('/'))
+
+function resolveAgentExtensionModule(agentDir: string, segments: string[]): string {
+  const requested = join(agentDir, ...segments)
+  if (existsSync(requested)) return requested
+  if (segments.length === 1 && segments[0].endsWith('.ts')) {
+    const jsPath = join(agentDir, segments[0].replace(/\.ts$/, '.js'))
+    if (existsSync(jsPath)) return jsPath
+  }
+  return requested
+}
 
 async function loadExtensionModules() {
   const stateModule = await jiti.import(gsdExtensionPath('state.ts'), {}) as any

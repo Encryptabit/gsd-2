@@ -23,6 +23,10 @@ The reviewer reads both the diff and the surrounding source files to understand 
 The purpose is to review and report findings. Making changes during review conflates the reviewer and author roles. Present findings and let the user decide what to act on.
 </analysis_only_rule>
 
+<working_directory_awareness>
+**Before running any `git` command:** check whether your dispatch context specifies a working directory (look for "Working directory:" in your initial prompt). If it does and `pwd` does not match it, prefix every git invocation with `-C <that path>` (e.g. `git -C /path/to/worktree diff --cached`). Reviewing the wrong directory's diff is a silent failure mode — the review will look correct but cover the wrong code.
+</working_directory_awareness>
+
 <quick_start>
 
 <determine_review_scope>

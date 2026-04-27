@@ -8,7 +8,7 @@
  * paths, commit type inference, and the runGit shell helper.
  */
 
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gsdRoot } from "./paths.js";
@@ -38,6 +38,7 @@ import {
 } from "./native-git-bridge.js";
 import { GSDError, GSD_MERGE_CONFLICT, GSD_GIT_ERROR } from "./errors.js";
 import { getErrorMessage } from "./error-utils.js";
+import { isInfrastructureError } from "./auto/infra-errors.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,22 @@ export interface GitPreferences {
    *  for forensic inspection.
    */
   absorb_snapshot_commits?: boolean;
+  /** #4765 — when to collapse worktree commits back to main.
+   *  - "milestone" (default): existing behavior — squash-merge happens once
+   *    at milestone completion or transition.
+   *  - "slice": squash-merge each slice's commits to main as soon as the
+   *    slice passes validation. Shrinks the orphan window from
+   *    milestone-size to slice-size and surfaces merge conflicts per slice
+   *    rather than all at once at milestone end.
+   */
+  collapse_cadence?: "milestone" | "slice";
+  /** #4765 — when `collapse_cadence: "slice"`, optionally re-squash the per-
+   *  slice commits on main into one milestone commit at milestone completion.
+   *  Preserves the "one commit per milestone in main" history shape that
+   *  `collapse_cadence: "milestone"` produces today.
+   *  Default: true when collapse_cadence is "slice", ignored otherwise.
+   */
+  milestone_resquash?: boolean;
 }
 
 export const VALID_BRANCH_NAME = /^[a-zA-Z0-9_\-\/.]+$/;
@@ -210,6 +227,7 @@ export interface PreMergeCheckResult {
  */
 export const RUNTIME_EXCLUSION_PATHS: readonly string[] = [
   ".gsd/activity/",
+  ".gsd/audit/",
   ".gsd/forensics/",
   ".gsd/runtime/",
   ".gsd/worktrees/",
@@ -390,6 +408,111 @@ export function resolveMilestoneIntegrationBranch(
     status: "missing",
     reason: `Recorded integration branch "${recordedBranch}" for milestone ${milestoneId} no longer exists, and no safe fallback branch could be determined.`,
   };
+}
+
+// ─── Pre-Merge Command Tokenizer ──────────────────────────────────────────
+
+/**
+ * Tokenize a user-supplied pre-merge command string into argv form, with
+ * minimal support for double- and single-quoted strings. Designed to be
+ * sufficient for typical commands ("npm test", `npm run lint:ci`,
+ * `pnpm run tsc --noEmit`) without spawning a shell.
+ *
+ * Returns [] when the input is empty or whitespace-only.
+ * Throws when quoting is malformed.
+ *
+ * Used by GitServiceImpl.runPreMergeCheck to eliminate the shell-injection
+ * surface that running an arbitrary user string through a shell would create.
+ * (Issue #4980 HIGH-2)
+ */
+export function tokenizePreMergeCommand(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let i = 0;
+  let quote: "" | "'" | '"' = "";
+  let hasContent = false;
+
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) {
+        quote = "";
+      } else if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        current += input[i + 1];
+        i += 2;
+        continue;
+      } else {
+        current += ch;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hasContent = true;
+      i++;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (hasContent) {
+        tokens.push(current);
+        current = "";
+        hasContent = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < input.length) {
+      current += input[i + 1];
+      i += 2;
+      hasContent = true;
+      continue;
+    }
+    current += ch;
+    hasContent = true;
+    i++;
+  }
+
+  if (quote) {
+    throw new Error(`Unterminated ${quote === '"' ? "double" : "single"} quote in pre-merge command`);
+  }
+  if (hasContent) tokens.push(current);
+  return tokens;
+}
+
+function containsUnquotedShellControl(input: string): boolean {
+  let i = 0;
+  let quote: "" | "'" | '"' = "";
+
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) {
+        quote = "";
+      } else if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < input.length) {
+      i += 2;
+      continue;
+    }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "`" || ch === "$" || ch === "<" || ch === ">") {
+      return true;
+    }
+    i++;
+  }
+
+  return false;
 }
 
 // ─── Git Helper ────────────────────────────────────────────────────────────
@@ -785,8 +908,34 @@ export class GitServiceImpl {
       }
     }
 
+    // Tokenize and run via execFileSync (no shell). Shell metacharacters in
+    // user-supplied prefs.pre_merge_check would otherwise be interpreted as
+    // chaining/redirection (e.g. `;`, `&&`, `|`, backticks) — a privesc
+    // surface in repos with a checked-in `.gsd/PREFERENCES.md`.
+    // (Issue #4980 HIGH-2)
+    if (containsUnquotedShellControl(command)) {
+      return {
+        passed: false,
+        skipped: false,
+        command,
+        error:
+          "pre_merge_check contains shell metacharacters (;, &&, |, $, backticks, redirects). " +
+          "Put complex commands in a script file (e.g. './scripts/pre-merge.sh') and reference the script path instead.",
+      };
+    }
+
+    const tokens = tokenizePreMergeCommand(command);
+    if (tokens.length === 0) {
+      return { passed: true, skipped: true };
+    }
+
     try {
-      execSync(command, { cwd: this.basePath, stdio: "pipe", encoding: "utf-8" });
+      execFileSync(tokens[0]!, tokens.slice(1), {
+        cwd: this.basePath,
+        stdio: "pipe",
+        encoding: "utf-8",
+        env: GIT_NO_PROMPT_ENV,
+      });
       return { passed: true, skipped: false, command };
     } catch (err) {
       const msg = getErrorMessage(err);
@@ -843,6 +992,17 @@ function buildTurnSnapshotLabel(unitType: string, unitId: string): string {
     .replace(/^[-/]+|[-/]+$/g, "") || "turn";
 }
 
+export function handleTurnGitActionError(action: TurnGitActionMode, err: unknown): TurnGitActionResult {
+  if (isInfrastructureError(err)) {
+    throw err;
+  }
+  return {
+    action,
+    status: "failed",
+    error: getErrorMessage(err),
+  };
+}
+
 export function runTurnGitAction(args: {
   basePath: string;
   action: TurnGitActionMode;
@@ -881,11 +1041,7 @@ export function runTurnGitAction(args: {
       dirty: nativeHasChanges(args.basePath),
     };
   } catch (err) {
-    return {
-      action: args.action,
-      status: "failed",
-      error: getErrorMessage(err),
-    };
+    return handleTurnGitActionError(args.action, err);
   }
 }
 

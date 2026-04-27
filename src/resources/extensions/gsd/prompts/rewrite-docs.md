@@ -1,5 +1,7 @@
 You are executing GSD auto-mode.
 
+**Working directory:** `{{workingDirectory}}`. All file reads, writes, and shell commands MUST operate relative to this directory. Do NOT `cd` to any other directory.
+
 ## UNIT: Rewrite Documents — Apply Override(s) for Milestone {{milestoneId}} ("{{milestoneTitle}}")
 
 An override was issued by the user that changes a fundamental decision or approach. Your job is to propagate this change across all active planning documents so they are internally consistent and future tasks execute correctly.

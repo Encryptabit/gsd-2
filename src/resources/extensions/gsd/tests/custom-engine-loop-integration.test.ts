@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { autoLoop, resolveAgentEnd, _resetPendingResolve } from "../auto-loop.js";
+import { autoLoop, resolveAgentEnd, _hasPendingResolveForTest, _resetPendingResolve } from "../auto-loop.js";
 import type { LoopDeps } from "../auto/loop-deps.js";
 import type { SessionLockStatus } from "../session-lock.js";
 import { writeGraph, readGraph, type WorkflowGraph, type GraphStep } from "../graph.ts";
@@ -27,6 +27,17 @@ function makeTmpDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "loop-integ-"));
   tmpDirs.push(dir);
   return dir;
+}
+
+async function resolveNextAgentEnd(timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!_hasPendingResolveForTest()) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for pending agent_end resolver");
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  resolveAgentEnd({ messages: [{ role: "assistant" }] });
 }
 
 afterEach(() => {
@@ -276,19 +287,16 @@ describe("Custom engine loop integration", () => {
     // We need to resolve resolveAgentEnd for each step.
 
     // Step 1: step-a
-    await new Promise((r) => setTimeout(r, 80));
     unitCount++;
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // Step 2: step-b
-    await new Promise((r) => setTimeout(r, 80));
     unitCount++;
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // Step 3: step-c
-    await new Promise((r) => setTimeout(r, 80));
     unitCount++;
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // After step-c completes, engine.reconcile marks it complete, then
     // next deriveState sees isComplete=true → stopAuto → loop exits
@@ -398,8 +406,7 @@ describe("Custom engine loop integration", () => {
 
     const loopPromise = autoLoop(ctx, pi, s, deps);
 
-    await new Promise((r) => setTimeout(r, 80));
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     await loopPromise;
 
@@ -460,12 +467,10 @@ describe("Custom engine loop integration", () => {
     const loopPromise = autoLoop(ctx, pi, s, deps);
 
     // Resolve step-a
-    await new Promise((r) => setTimeout(r, 80));
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // Resolve step-b
-    await new Promise((r) => setTimeout(r, 80));
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     await loopPromise;
 
@@ -481,7 +486,177 @@ describe("Custom engine loop integration", () => {
     );
   });
 
-  it("GRAPH.yaml step stays pending when session deactivates before reconcile", async () => {
+  it("stops custom workflow after repeated verification retries", async () => {
+    _resetPendingResolve();
+
+    const runDir = makeTmpDir();
+    const graph = makeGraph([makeStep({ id: "retry-step" })], "retry-exhaustion");
+    writeGraph(runDir, graph);
+    writeFileSync(join(runDir, "DEFINITION.yaml"), stringify({
+      version: 1,
+      name: "retry-exhaustion",
+      steps: [{
+        id: "retry-step",
+        name: "retry-step",
+        prompt: "Do retry-step",
+        produces: "retry-step/output.md",
+        verify: { policy: "shell-command", command: "exit 1" },
+      }],
+    }));
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+    const s = makeLoopSession({
+      activeEngineId: "custom",
+      activeRunDir: runDir,
+      basePath: runDir,
+    });
+    const deps = makeMockDeps({
+      stopAuto: async (_ctx, _pi, reason) => {
+        deps.callLog.push(`stopAuto:${reason ?? "no-reason"}`);
+        s.active = false;
+      },
+    });
+
+    const resolver = setInterval(() => {
+      if (_hasPendingResolveForTest()) {
+        resolveAgentEnd({ messages: [{ role: "assistant" }] });
+      }
+    }, 25);
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        autoLoop(ctx, pi, s, deps),
+        new Promise((_, reject) =>
+          timeout = setTimeout(() => {
+            s.active = false;
+            resolveAgentEnd({ messages: [{ role: "assistant" }] });
+            reject(new Error(
+              `autoLoop did not stop after verification retry exhaustion; calls=${pi.calls.length}; log=${deps.callLog.join(",")}`,
+            ));
+          }, 3_000),
+        ),
+      ]);
+    } finally {
+      clearInterval(resolver);
+      if (timeout) clearTimeout(timeout);
+    }
+
+    assert.equal(pi.calls.length, 4, "verification retry should be capped after four dispatched attempts");
+    const stopEntry = deps.callLog.find((e: string) => e.startsWith("stopAuto:"));
+    assert.match(stopEntry ?? "", /requested retry 4 times without passing/);
+    const finalGraph = readGraph(runDir);
+    assert.equal(finalGraph.steps[0]?.status, "active", "failed verification must not reconcile the step complete");
+  });
+
+  it("persists custom verification retry budget across a session restart", async () => {
+    _resetPendingResolve();
+
+    const runDir = makeTmpDir();
+    const graph = makeGraph([makeStep({ id: "retry-step" })], "retry-restart");
+    writeGraph(runDir, graph);
+    writeFileSync(join(runDir, "DEFINITION.yaml"), stringify({
+      version: 1,
+      name: "retry-restart",
+      steps: [{
+        id: "retry-step",
+        name: "retry-step",
+        prompt: "Do retry-step",
+        produces: "retry-step/output.md",
+        verify: { policy: "shell-command", command: "exit 1" },
+      }],
+    }));
+
+    const ctx1 = makeMockCtx();
+    const pi1 = makeMockPi();
+    const s1 = makeLoopSession({
+      activeEngineId: "custom",
+      activeRunDir: runDir,
+      basePath: runDir,
+    });
+    const deps1 = makeMockDeps();
+    const resolver1 = setInterval(() => {
+      if (_hasPendingResolveForTest()) {
+        resolveAgentEnd({ messages: [{ role: "assistant" }] });
+      }
+      if (pi1.calls.length >= 2) {
+        s1.active = false;
+      }
+    }, 25);
+    let timeout1: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        autoLoop(ctx1, pi1, s1, deps1),
+        new Promise((_, reject) =>
+          timeout1 = setTimeout(() => {
+            s1.active = false;
+            resolveAgentEnd({ messages: [{ role: "assistant" }] });
+            reject(new Error(
+              `first autoLoop did not pause after two retry attempts; calls=${pi1.calls.length}; log=${deps1.callLog.join(",")}`,
+            ));
+          }, 3_000),
+        ),
+      ]);
+    } finally {
+      clearInterval(resolver1);
+      if (timeout1) clearTimeout(timeout1);
+    }
+    assert.equal(pi1.calls.length, 2, "first session should consume two retry attempts");
+    assert.equal(
+      deps1.callLog.some((e: string) => e.startsWith("stopAuto:")),
+      false,
+      "first session should stop because the session deactivated, not because retry budget exhausted",
+    );
+
+    _resetPendingResolve();
+    const ctx2 = makeMockCtx();
+    const pi2 = makeMockPi();
+    const s2 = makeLoopSession({
+      activeEngineId: "custom",
+      activeRunDir: runDir,
+      basePath: runDir,
+    });
+    const deps2 = makeMockDeps({
+      stopAuto: async (_ctx, _pi, reason) => {
+        deps2.callLog.push(`stopAuto:${reason ?? "no-reason"}`);
+        s2.active = false;
+      },
+    });
+    const resolver2 = setInterval(() => {
+      if (_hasPendingResolveForTest()) {
+        resolveAgentEnd({ messages: [{ role: "assistant" }] });
+      }
+    }, 25);
+    let timeout2: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        autoLoop(ctx2, pi2, s2, deps2),
+        new Promise((_, reject) =>
+          timeout2 = setTimeout(() => {
+            s2.active = false;
+            resolveAgentEnd({ messages: [{ role: "assistant" }] });
+            reject(new Error(
+              `second autoLoop did not stop after persisted retry exhaustion; calls=${pi2.calls.length}; log=${deps2.callLog.join(",")}`,
+            ));
+          }, 3_000),
+        ),
+      ]);
+    } finally {
+      clearInterval(resolver2);
+      if (timeout2) clearTimeout(timeout2);
+    }
+
+    assert.equal(pi2.calls.length, 2, "second session should exhaust after attempts 3 and 4");
+    const stopEntry = deps2.callLog.find((e: string) => e.startsWith("stopAuto:"));
+    assert.match(stopEntry ?? "", /requested retry 4 times without passing/);
+  });
+
+  it("two-step workflow drives both steps to complete and stops when isComplete fires", async () => {
+    // Note (#4831): renamed from "GRAPH.yaml step stays pending when session
+    // deactivates before reconcile" — the assertion body never proved the
+    // pending-on-deactivate claim and even comments that "the reconcile
+    // will still run for step-b". The behaviour this test actually pins is:
+    // both steps reconcile complete and stopAuto fires once isComplete.
     _resetPendingResolve();
 
     // Two-step workflow: a → b. We will complete step-a, then force a break
@@ -513,28 +688,30 @@ describe("Custom engine loop integration", () => {
     const loopPromise = autoLoop(ctx, pi, s, deps);
 
     // Resolve step-a successfully
-    await new Promise((r) => setTimeout(r, 80));
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // Step-b enters runUnit — deactivate the session before resolving.
     // runUnit checks s.active after newSession and returns cancelled if false.
     // But since newSession resolves synchronously in our mock (before the
     // active check), the unit still runs. Instead, let's just cancel it.
-    await new Promise((r) => setTimeout(r, 80));
     // Resolve as cancelled to simulate a failed session
-    resolveAgentEnd({ messages: [{ role: "assistant" }] });
+    await resolveNextAgentEnd();
 
     // The reconcile will still run for step-b in this flow since
     // runUnitPhase returns "next" (not "break") for completed units.
     // After both steps complete, the engine detects isComplete and stops.
     await loopPromise;
 
-    // Verify step-a is complete
+    // Both steps reconcile complete; the renamed expectation pins that the
+    // engine drives the workflow through isComplete rather than leaving any
+    // step pending.
     const finalGraph = readGraph(runDir);
     const stepA = finalGraph.steps.find(s => s.id === "step-a");
+    const stepB = finalGraph.steps.find(s => s.id === "step-b");
     assert.equal(stepA?.status, "complete", "Step-a should be complete");
+    assert.equal(stepB?.status, "complete", "Step-b should be complete");
 
-    // Verify the loop stopped appropriately
+    // The loop must stop once isComplete fires.
     assert.ok(
       deps.callLog.some((e: string) => e.startsWith("stopAuto:")),
       "stopAuto should have been called",

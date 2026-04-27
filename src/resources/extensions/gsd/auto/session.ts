@@ -21,6 +21,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import type { GitServiceImpl } from "../git-service.js";
 import type { CaptureEntry } from "../captures.js";
 import type { BudgetAlertLevel } from "../auto-budget.js";
+import { resolveWorktreeProjectRoot } from "../worktree-root.js";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
@@ -75,9 +76,7 @@ export interface PreExecFailure {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-export const MAX_UNIT_DISPATCHES = 3;
 export const STUB_RECOVERY_THRESHOLD = 2;
-export const MAX_LIFETIME_DISPATCHES = 6;
 export const NEW_SESSION_TIMEOUT_MS = 120_000;
 
 // ─── AutoSession ─────────────────────────────────────────────────────────────
@@ -178,6 +177,12 @@ export class AutoSession {
    *  stopAuto does not attempt the same merge a second time (#2645). */
   milestoneMergedInPhases = false;
 
+  // #4765 — slice-cadence collapse: main-branch SHAs at the moment each
+  // milestone's first slice merge began. Used by resquashMilestoneOnMain at
+  // milestone completion to collapse N slice commits into one. Cleared when
+  // the milestone finishes (or resquash runs).
+  milestoneStartShas: Map<string, string> = new Map();
+
   // ── Dispatch circuit breakers ──────────────────────────────────────
   rewriteAttemptCount = 0;
   /** Tracks consecutive bootstrap attempts that found phase === "complete".
@@ -189,6 +194,8 @@ export class AutoSession {
   lastPromptCharCount: number | undefined;
   lastBaselineCharCount: number | undefined;
   pendingQuickTasks: CaptureEntry[] = [];
+  /** Timestamp of the last LLM request dispatch (ms since epoch). Used for proactive rate limiting. */
+  lastRequestTimestamp = 0;
 
   // ── Safety harness ───────────────────────────────────────────────────────
   /** SHA of the pre-unit git checkpoint ref. Cleared on success or rollback. */
@@ -220,12 +227,7 @@ export class AutoSession {
   }
 
   get lockBasePath(): string {
-    // Prefer originalBasePath (project root); fall back to basePath.
-    // Strip /.gsd/worktrees/ suffix if basePath is itself a worktree path
-    // to avoid reading/writing the lock inside the worktree (#3729).
-    const resolved = this.originalBasePath || this.basePath;
-    const markerIdx = resolved.indexOf("/.gsd/worktrees/");
-    return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
+    return resolveWorktreeProjectRoot(this.basePath, this.originalBasePath);
   }
 
   reset(): void {
@@ -290,6 +292,7 @@ export class AutoSession {
     this.lastPromptCharCount = undefined;
     this.lastBaselineCharCount = undefined;
     this.pendingQuickTasks = [];
+    this.lastRequestTimestamp = 0;
     this.sidecarQueue = [];
     this.rewriteAttemptCount = 0;
     this.consecutiveCompleteBootstraps = 0;
@@ -299,6 +302,7 @@ export class AutoSession {
     this.lastGitActionStatus = null;
     this.isolationDegraded = false;
     this.milestoneMergedInPhases = false;
+    this.milestoneStartShas = new Map();
     this.checkpointSha = null;
 
     // Signal handler

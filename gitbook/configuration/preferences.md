@@ -52,6 +52,9 @@ git:
   auto_push: true
   merge_strategy: squash
   isolation: worktree
+  collapse_cadence: milestone   # or "slice" — see Git & Worktrees docs
+  # milestone_resquash applies only when collapse_cadence: "slice"
+  # milestone_resquash: true    # collapse slice commits into one at milestone end
 
 # Verification
 verification_commands:
@@ -117,6 +120,16 @@ auto_supervisor:
   hard_timeout_minutes: 30    # pause auto mode
 ```
 
+### `min_request_interval_ms`
+
+Minimum milliseconds between auto-mode LLM request dispatches. Use this to proactively slow auto-mode on rate-limited providers and reduce 429 errors. Set to `0` to disable.
+
+```yaml
+min_request_interval_ms: 1000   # wait at least 1 second between LLM requests
+```
+
+Default: `0` (disabled)
+
 ### `verification_commands`
 
 Shell commands that run after every task execution:
@@ -141,6 +154,17 @@ phases:
   reassess_after_slice: true
   require_slice_discussion: false
 ```
+
+### `reactive_execution`
+
+Automatic parallel task dispatch inside a slice. Reactive execution is enabled by default and only dispatches when task-plan IO annotations produce a non-ambiguous graph with enough ready, non-conflicting tasks.
+
+```yaml
+reactive_execution:
+  enabled: false    # opt out
+```
+
+When omitted, GSD uses the default-on threshold of three ready tasks. Set `enabled: true` explicitly to use the lower two-ready-task threshold. Optional fields: `max_parallel` (default `2`, range `1`-`8`), `isolation_mode: same-tree`, and `subagent_model`.
 
 ### `skill_discovery`
 

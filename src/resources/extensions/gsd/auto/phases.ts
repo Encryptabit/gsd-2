@@ -26,12 +26,13 @@ import {
 import { detectStuck } from "./detect-stuck.js";
 import { runUnit } from "./run-unit.js";
 import { debugLog } from "../debug-logger.js";
-import { PROJECT_FILES } from "../detection.js";
+import { resolveWorktreeProjectRoot } from "../worktree-root.js";
+import { PROJECT_FILES, hasProjectFileInAncestor } from "../detection.js";
 import { MergeConflictError } from "../git-service.js";
 import { setCurrentPhase, clearCurrentPhase } from "../../shared/gsd-phase-state.js";
 import { pauseAutoForProviderError } from "../provider-error-pause.js";
 import { resumeAutoAfterProviderDelay } from "../bootstrap/provider-error-resume.js";
-import { join, basename, dirname, parse as parsePath } from "node:path";
+import { join, basename } from "node:path";
 import { existsSync, cpSync, readdirSync } from "node:fs";
 import {
   logWarning,
@@ -51,7 +52,7 @@ import { getEligibleSlices } from "../slice-parallel-eligibility.js";
 import { startSliceParallel } from "../slice-parallel-orchestrator.js";
 import { isDbAvailable, getMilestoneSlices } from "../gsd-db.js";
 import type { MinimalModelRegistry } from "../context-budget.js";
-import { ensurePlanV2Graph } from "../uok/plan-v2.js";
+import { ensurePlanV2Graph, isMissingFinalizedContextResult } from "../uok/plan-v2.js";
 import { resolveUokFlags } from "../uok/flags.js";
 import { UokGateRunner } from "../uok/gate-runner.js";
 import { resetEvidence, loadEvidenceFromDisk } from "../safety/evidence-collector.js";
@@ -81,11 +82,7 @@ export function resetSessionTimeoutState(): void {
  * Exported for testing as _resolveReportBasePath.
  */
 export function _resolveReportBasePath(s: Pick<AutoSession, "originalBasePath" | "basePath">): string {
-  // Strip /.gsd/worktrees/ suffix when basePath is itself a worktree path and
-  // originalBasePath is falsy — prevents reports landing in the worktree (#3729).
-  const resolved = s.originalBasePath || s.basePath;
-  const markerIdx = resolved.indexOf("/.gsd/worktrees/");
-  return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
+  return resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
 }
 
 /**
@@ -96,12 +93,7 @@ export function _resolveReportBasePath(s: Pick<AutoSession, "originalBasePath" |
 export function _resolveDispatchGuardBasePath(
   s: Pick<AutoSession, "originalBasePath" | "basePath">,
 ): string {
-  // Strip /.gsd/worktrees/ suffix when basePath is itself a worktree path and
-  // originalBasePath is falsy — prevents guard checks running against the
-  // worktree instead of the project root (#3729).
-  const resolved = s.originalBasePath || s.basePath;
-  const markerIdx = resolved.indexOf("/.gsd/worktrees/");
-  return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
+  return resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
 }
 
 const PLAN_V2_GATE_PHASES: ReadonlySet<Phase> = new Set([
@@ -201,6 +193,7 @@ async function closeoutAndStop(
       s.currentUnit.startedAt,
       deps.buildSnapshotOpts(s.currentUnit.type, s.currentUnit.id),
     );
+    s.currentUnit = null;
   }
   await deps.stopAuto(ctx, pi, reason);
 }
@@ -420,27 +413,41 @@ export async function runPreDispatch(
     const compiled = ensurePlanV2Graph(s.basePath, state);
     if (!compiled.ok) {
       const reason = compiled.reason ?? "Plan v2 compilation failed";
+      if (isMissingFinalizedContextResult(compiled)) {
+        await runPreDispatchGate({
+          gateId: "plan-v2-gate",
+          gateType: "policy",
+          outcome: "pass",
+          failureClass: "none",
+          rationale: "plan v2 missing context recovery deferred to dispatch",
+          findings: reason,
+          milestoneId: state.activeMilestone?.id ?? undefined,
+        });
+      } else {
+        await runPreDispatchGate({
+          gateId: "plan-v2-gate",
+          gateType: "policy",
+          outcome: "manual-attention",
+          failureClass: "manual-attention",
+          rationale: "plan v2 compile gate failed",
+          findings: reason,
+          milestoneId: state.activeMilestone?.id ?? undefined,
+        });
+        ctx.ui.notify(`Plan gate failed-closed: ${reason}\n\nIf this keeps happening, try: /gsd doctor heal`, "error");
+        await deps.pauseAuto(ctx, pi);
+        return { action: "break", reason: "plan-v2-gate-failed" };
+      }
+    }
+    if (compiled.ok) {
       await runPreDispatchGate({
         gateId: "plan-v2-gate",
         gateType: "policy",
-        outcome: "manual-attention",
-        failureClass: "manual-attention",
-        rationale: "plan v2 compile gate failed",
-        findings: reason,
+        outcome: "pass",
+        failureClass: "none",
+        rationale: "plan v2 compile gate passed",
         milestoneId: state.activeMilestone?.id ?? undefined,
       });
-      ctx.ui.notify(`Plan gate failed-closed: ${reason}\n\nIf this keeps happening, try: /gsd doctor heal`, "error");
-      await deps.pauseAuto(ctx, pi);
-      return { action: "break", reason: "plan-v2-gate-failed" };
     }
-    await runPreDispatchGate({
-      gateId: "plan-v2-gate",
-      gateType: "policy",
-      outcome: "pass",
-      failureClass: "none",
-      rationale: "plan v2 compile gate passed",
-      milestoneId: state.activeMilestone?.id ?? undefined,
-    });
   }
   deps.syncCmuxSidebar(prefs, state);
   let mid = state.activeMilestone?.id;
@@ -947,10 +954,14 @@ export async function runDispatch(
   // ── Sliding-window stuck detection with graduated recovery ──
   const derivedKey = `${unitType}/${unitId}`;
 
-  if (!s.pendingVerificationRetry) {
-    loopState.recentUnits.push({ key: derivedKey });
-    if (loopState.recentUnits.length > STUCK_WINDOW_SIZE) loopState.recentUnits.shift();
+  // Always record this dispatch in the sliding window so detectStuck() has
+  // accurate history. Skipping the push when pendingVerificationRetry is set
+  // caused infinite artifact-retry loops to be invisible to stuck detection
+  // (#2007). Only the *response* to a stuck signal is suppressed during retries.
+  loopState.recentUnits.push({ key: derivedKey });
+  if (loopState.recentUnits.length > STUCK_WINDOW_SIZE) loopState.recentUnits.shift();
 
+  if (!s.pendingVerificationRetry) {
     const stuckSignal = detectStuck(loopState.recentUnits);
     if (stuckSignal) {
       debugLog("autoLoop", {
@@ -1323,7 +1334,7 @@ export async function runUnitPhase(
   iterData: IterationData,
   loopState: LoopState,
   sidecarItem?: SidecarItem,
-): Promise<PhaseResult<{ unitStartedAt: number }>> {
+): Promise<PhaseResult<{ unitStartedAt?: number; requestDispatchedAt?: number }>> {
   const { ctx, pi, s, deps, prefs } = ic;
   const { unitType, unitId, prompt, state, mid } = iterData;
 
@@ -1364,21 +1375,10 @@ export async function runUnitPhase(
     // Monorepo support (#2347): if no project files in the worktree directory,
     // walk parent directories up to the filesystem root. In monorepos,
     // package.json / Cargo.toml etc. live in a parent directory.
-    let hasProjectFileInParent = false;
-    if (!hasProjectFile && !hasSrcDir && !hasXcodeBundle) {
-      let checkDir = dirname(s.basePath);
-      const { root } = parsePath(checkDir);
-      while (checkDir !== root) {
-        // Stop at git repository boundary — ancestors above the repo root
-        // (e.g. ~ or /usr/local) may contain unrelated project files.
-        if (deps.existsSync(join(checkDir, ".git"))) break;
-        if (PROJECT_FILES.some((f) => deps.existsSync(join(checkDir, f)))) {
-          hasProjectFileInParent = true;
-          break;
-        }
-        checkDir = dirname(checkDir);
-      }
-    }
+    const hasProjectFileInParent =
+      !hasProjectFile && !hasSrcDir && !hasXcodeBundle
+        ? hasProjectFileInAncestor(s.basePath, deps.existsSync)
+        : false;
     if (!hasProjectFile && !hasSrcDir && !hasXcodeBundle && !hasProjectFileInParent) {
       // Greenfield projects won't have project files yet — the first task creates them.
       // Log a warning but allow execution to proceed. The .git check above is sufficient
@@ -1680,9 +1680,23 @@ export async function runUnitPhase(
 
   if (unitResult.status === "cancelled") {
     const errorCategory = unitResult.errorContext?.category;
-    // Provider-error pause: pauseAuto already handled cleanup and scheduled
-    // recovery. Don't hard-stop — just break out of the loop (#2762).
+    // Provider-error pause: agent_end recovery normally pauses before this
+    // branch. Provider readiness failures happen before dispatch, so pause here
+    // if nothing upstream already did.
     if (errorCategory === "provider") {
+      if (!s.paused) {
+        const detail = unitResult.errorContext?.message ?? `Provider unavailable for ${unitType} ${unitId}`;
+        await pauseAutoForProviderError(
+          ctx.ui,
+          detail,
+          () => deps.pauseAuto(ctx, pi),
+          {
+            isRateLimit: false,
+            isTransient: Boolean(unitResult.errorContext?.isTransient),
+            retryAfterMs: unitResult.errorContext?.retryAfterMs,
+          },
+        );
+      }
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
       debugLog("autoLoop", { phase: "exit", reason: "provider-pause", isTransient: unitResult.errorContext?.isTransient });
       return { action: "break", reason: "provider-pause" };
@@ -1838,7 +1852,7 @@ export async function runUnitPhase(
         );
         // Fall through to next iteration where dispatch will re-derive
         // and re-dispatch this unit.
-        return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt } };
+        return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
       }
     }
   }
@@ -1902,7 +1916,7 @@ export async function runUnitPhase(
     s.checkpointSha = null;
   }
 
-  return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt } };
+  return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
 }
 
 // ─── runFinalize ──────────────────────────────────────────────────────────────
@@ -2084,6 +2098,8 @@ export async function runFinalize(
 
   // Both pre and post verification completed without timeout — reset counter
   loopState.consecutiveFinalizeTimeouts = 0;
+  s.currentUnit = null;
+  clearCurrentPhase();
 
   // Surface accumulated workflow-logger issues for this unit to the user.
   // Warnings/errors logged during the unit are buffered in the logger and

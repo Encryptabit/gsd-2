@@ -1,3 +1,5 @@
+**Working directory:** `{{workingDirectory}}`. All file reads, writes, and shell commands MUST operate relative to this directory. Do NOT `cd` to any other directory.
+
 Discuss milestone {{milestoneId}} ("{{milestoneTitle}}"). Identify gray areas, ask the user about them, and write `{{milestoneId}}-CONTEXT.md` in the milestone directory with the decisions. Use the **Context** output template below. If a `GSD Skill Preferences` block is present in system context, use it to decide which skills to load and follow; do not override required artifact rules.
 
 **Structured questions available: {{structuredQuestionsAvailable}}**

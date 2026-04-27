@@ -162,6 +162,46 @@ Recommended verification order:
 | `GSD_CODING_AGENT_DIR` | `$GSD_HOME/agent` | Agent directory containing managed resources, extensions, and auth. Takes precedence over `GSD_HOME` for agent paths. |
 | `GSD_ALLOWED_COMMAND_PREFIXES` | (built-in list) | Comma-separated command prefixes allowed for `!command` value resolution. Overrides `allowedCommandPrefixes` in settings.json. See [Custom Models — Command Allowlist](custom-models.md#command-allowlist). |
 | `GSD_FETCH_ALLOWED_URLS` | (none) | Comma-separated hostnames exempted from `fetch_page` URL blocking. Overrides `fetchAllowedUrls` in settings.json. See [URL Blocking](#url-blocking-fetch_page). |
+| `PI_TOKEN_TELEMETRY` | (unset) | Set to literal `1` to emit opt-in per-call token telemetry as JSONL on stderr. Other values are ignored. |
+
+### Token Telemetry
+
+Set `PI_TOKEN_TELEMETRY=1` when you need raw per-call token and cache data for cost analysis or prompt-cache tuning. The stream is off by default and writes to stderr, so stdout remains available for the TUI or for headless `--json` events.
+
+```bash
+# Capture telemetry separately from headless JSONL events
+PI_TOKEN_TELEMETRY=1 gsd headless --json auto \
+  > gsd-events.jsonl \
+  2> token-telemetry.jsonl
+
+# Capture telemetry from an interactive session
+PI_TOKEN_TELEMETRY=1 gsd 2> token-telemetry.jsonl
+```
+
+Each line is one JSON object with this shape:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | Assistant message timestamp in milliseconds since Unix epoch. |
+| `model` | Model identifier used for the call. |
+| `stopReason` | Provider stop reason recorded for the assistant message, such as `stop` or `error`. |
+| `input` | Input tokens reported for the call, excluding tokens served from prompt cache. |
+| `output` | Output tokens reported for the call. |
+| `cacheRead` | Input tokens read from prompt cache. |
+| `cacheWrite` | Input tokens written to prompt cache. |
+| `costTotal` | Provider total cost from the model registry. This is `0` when no rate is known for the model. |
+| `cacheHitRatio` | `cacheRead / (cacheRead + input)`. This is `0` when both values are zero and `1` for a full cache hit. |
+
+Telemetry is emitted per assistant API attempt, not per user turn. If a provider call records an error and auto-retry runs, the failed attempt can produce a line with `stopReason: "error"`, and each retry attempt that reaches an assistant message produces its own line. Keep all lines for billed-attempt accounting; group with session logs or timestamps downstream if you need a deduplicated final-response view.
+
+### Ollama
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL. A bare `host:port` value is treated as `http://host:port`. |
+| `OLLAMA_API_KEY` | (none) | Bearer token for remote or cloud Ollama endpoints. Local Ollama ignores this header. |
+| `OLLAMA_PROBE_TIMEOUT_MS` | `1500` | Startup health-check timeout in milliseconds. Unset, empty, non-numeric, zero, or negative values fall back to the default. Values above `2147483647` ms are capped to Node.js's maximum timer delay. |
+| `OLLAMA_REQUEST_TIMEOUT_MS` | `10000` | Per-request REST timeout in milliseconds. Unset, empty, non-numeric, zero, or negative values fall back to the default. Values above `2147483647` ms are capped to Node.js's maximum timer delay. |
 
 ## All Settings
 
@@ -273,6 +313,26 @@ These are usually set automatically by `token_profile`, but can be overridden ex
 
 > **Note:** Roadmap reassessment requires `reassess_after_slice: true` to be set explicitly. Without it, reassessment is skipped regardless of `skip_reassess`.
 
+### `reactive_execution`
+
+Controls automatic parallel task dispatch inside a slice. This is enabled by default and only dispatches when task-plan IO annotations produce a non-ambiguous graph with enough ready, non-conflicting tasks.
+
+```yaml
+reactive_execution:
+  enabled: false    # opt out; omit this block to keep default-on behavior
+```
+
+Defaults and tuning:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Set to `false` to force sequential task execution. Set to `true` explicitly to use the lower two-ready-task threshold. |
+| `max_parallel` | number | `2` | Maximum tasks to dispatch in one reactive batch. Valid range: `1`-`8`. |
+| `isolation_mode` | string | `same-tree` | Execution isolation mode. `same-tree` is currently the only supported value. |
+| `subagent_model` | string | `models.subagent` fallback | Optional model override for reactive task subagents. |
+
+When `enabled` is omitted, reactive execution uses the default-on safety threshold of three ready tasks before it attempts a parallel batch. When `enabled: true` is set explicitly, GSD uses the earlier opt-in threshold of two ready tasks.
+
 ### `skill_discovery`
 
 Controls how GSD finds and applies skills during auto mode.
@@ -294,6 +354,16 @@ auto_supervisor:
   idle_timeout_minutes: 10    # detect stalls
   hard_timeout_minutes: 30    # pause auto mode
 ```
+
+### `min_request_interval_ms`
+
+Minimum milliseconds between auto-mode LLM request dispatches. Use this to proactively slow auto-mode on rate-limited providers and reduce 429 errors. Set to `0` to disable.
+
+```yaml
+min_request_interval_ms: 1000   # wait at least 1 second between LLM requests
+```
+
+Default: `0` (disabled)
 
 ### `budget_ceiling`
 
@@ -699,6 +769,15 @@ dynamic_routing:
   escalate_on_failure: true
   budget_pressure: true
   cross_provider: true
+```
+
+### `disabled_model_providers` (v2.60)
+
+Hide specific providers from model selection and routing without removing their auth credentials. Useful when you want a provider for tools (like `google_search`) but never want its models in `/model` or auto routing.
+
+```yaml
+disabled_model_providers:
+  - google-gemini-cli
 ```
 
 ### `context_management` (v2.59)

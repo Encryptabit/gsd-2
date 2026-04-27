@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useCallback, useState } from "react"
 import { useTheme } from "next-themes"
-import { Plus, X, TerminalSquare, Loader2, ImagePlus } from "lucide-react"
+import { AlertCircle, Plus, X, TerminalSquare, Loader2, ImagePlus } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { validateImageFile } from "@/lib/image-utils"
 import { filterInitialGsdHeader } from "@/lib/initial-gsd-header-filter"
@@ -162,13 +162,20 @@ function TerminalInstance({
     while (inputQueueRef.current.length > 0) {
       const data = inputQueueRef.current.shift()!
       try {
-        await authFetch(buildProjectPath("/api/terminal/input", projectCwd), {
+        const res = await authFetch(buildProjectPath("/api/terminal/input", projectCwd), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: sessionId, data }),
         })
+        if (!res.ok) {
+          if (res.status >= 500) inputQueueRef.current.unshift(data)
+          onConnectionChangeRef.current(false)
+          termRef.current?.writeln(`\r\nInput failed (${res.status}). Reconnect the terminal and retry.`)
+          break
+        }
       } catch {
         inputQueueRef.current.unshift(data)
+        onConnectionChangeRef.current(false)
         break
       }
     }
@@ -501,6 +508,7 @@ export function ShellTerminal({
   ])
   const [activeTabId, setActiveTabId] = useState(defaultId)
   const [isDragOver, setIsDragOver] = useState(false)
+  const [terminalError, setTerminalError] = useState<string | null>(null)
   const terminalAreaRef = useRef<HTMLDivElement>(null)
 
   // When the project changes, the defaultId changes.  Reset tabs so the
@@ -509,11 +517,12 @@ export function ShellTerminal({
   // when the session ID matches, preserving terminal state.
   const prevDefaultIdRef = useRef(defaultId)
   useEffect(() => {
-    if (prevDefaultIdRef.current !== defaultId) {
-      prevDefaultIdRef.current = defaultId
-      setTabs([{ id: defaultId, label: commandLabel, connected: false }])
-      setActiveTabId(defaultId)
-    }
+      if (prevDefaultIdRef.current !== defaultId) {
+        prevDefaultIdRef.current = defaultId
+        setTabs([{ id: defaultId, label: commandLabel, connected: false }])
+        setActiveTabId(defaultId)
+        setTerminalError(null)
+      }
   }, [defaultId, commandLabel])
 
   // ── Drag-and-drop handlers (native DOM, capture phase) ──────────────────
@@ -606,16 +615,25 @@ export function ShellTerminal({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(command ? { command } : {}),
       })
-      const data = (await res.json()) as { id: string }
+      if (!res.ok) {
+        setTerminalError(`Could not create terminal (${res.status}).`)
+        return
+      }
+      const data = (await res.json()) as { id?: unknown }
+      if (typeof data.id !== "string" || data.id.length === 0) {
+        setTerminalError("Could not create terminal: invalid server response.")
+        return
+      }
       const newTab: TerminalTab = {
         id: data.id,
         label: commandLabel,
         connected: false,
       }
+      setTerminalError(null)
       setTabs((prev) => [...prev, newTab])
       setActiveTabId(data.id)
-    } catch {
-      /* network error */
+    } catch (error) {
+      setTerminalError(`Could not create terminal: ${error instanceof Error ? error.message : String(error)}`)
     }
   }, [command, commandLabel, projectCwd])
 
@@ -673,6 +691,13 @@ export function ShellTerminal({
           <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-background backdrop-blur-sm border-2 border-dashed border-primary rounded-md pointer-events-none">
             <ImagePlus className="h-8 w-8 text-primary" />
             <span className="text-sm font-medium text-primary">Drop image here</span>
+          </div>
+        )}
+
+        {terminalError && (
+          <div className="absolute left-2 right-2 top-2 z-30 flex items-center gap-2 rounded border border-destructive/40 bg-background px-2 py-1 text-xs text-destructive shadow-sm">
+            <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+            <span className="min-w-0 truncate">{terminalError}</span>
           </div>
         )}
       </div>

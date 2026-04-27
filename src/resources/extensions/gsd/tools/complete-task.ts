@@ -38,6 +38,7 @@ import { writeManifest } from "../workflow-manifest.js";
 import { appendEvent } from "../workflow-events.js";
 import { logWarning, logError } from "../workflow-logger.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
+import { isStaleWrite } from "../auto/turn-epoch.js";
 import { buildEscalationArtifact, writeEscalationArtifact } from "../escalation.js";
 
 export interface CompleteTaskResult {
@@ -45,7 +46,19 @@ export interface CompleteTaskResult {
   sliceId: string;
   milestoneId: string;
   summaryPath: string;
+  /**
+   * True when the targeted task was already in complete/done. The handler is
+   * idempotent in that case — no DB mutation, no rewritten SUMMARY.md.
+   */
   alreadyComplete?: boolean;
+  /**
+   * True when this call re-completed an already-closed task from a turn that
+   * had been superseded by timeout recovery or cancellation. The underlying
+   * state was not mutated; the response is a no-op shaped like a success so
+   * the orphaned LLM tool call resolves cleanly.
+   */
+  duplicate?: boolean;
+  stale?: boolean;
 }
 
 import type { TaskRow } from "../gsd-db.js";
@@ -234,12 +247,20 @@ export async function handleCompleteTask(
     }
 
     const existingTask = getTask(params.milestoneId, params.sliceId, params.taskId);
-    if (existingTask && isCompletedStatus(existingTask.status)) {
-      alreadyComplete = true;
-      return;
-    }
-
     if (existingTask && isClosedStatus(existingTask.status)) {
+      // Stale-turn path: a timed-out turn that was superseded by recovery
+      // can still reach this code when its LLM call eventually returns and
+      // invokes gsd_complete_task. Returning an error would produce noisy
+      // logs in the orphaned turn. Sentinel handled below — outside the
+      // transaction — so we don't render SUMMARY.md or flip plan checkboxes.
+      if (isStaleWrite("complete-task")) {
+        guardError = "__stale_duplicate__";
+        return;
+      }
+      if (isCompletedStatus(existingTask.status)) {
+        alreadyComplete = true;
+        return;
+      }
       guardError = `task ${params.taskId} is ${existingTask.status} — use gsd_task_reopen first if you need to complete it`;
       return;
     }
@@ -276,6 +297,34 @@ export async function handleCompleteTask(
       });
     }
   });
+
+  if (guardError === "__stale_duplicate__") {
+    // Orphaned-turn duplicate: the task is already complete from the
+    // superseded turn's earlier (real) call. Return a non-mutating success
+    // so the stale LLM tool call unwinds cleanly. summaryPath is synthesized
+    // from the existing on-disk layout; no file is written.
+    const tasksDir = resolveTasksDir(basePath, params.milestoneId, params.sliceId);
+    const staleSummaryPath = tasksDir
+      ? join(tasksDir, `${params.taskId}-SUMMARY.md`)
+      : join(
+          basePath,
+          ".gsd",
+          "milestones",
+          params.milestoneId,
+          "slices",
+          params.sliceId,
+          "tasks",
+          `${params.taskId}-SUMMARY.md`,
+        );
+    return {
+      taskId: params.taskId,
+      sliceId: params.sliceId,
+      milestoneId: params.milestoneId,
+      summaryPath: staleSummaryPath,
+      duplicate: true,
+      stale: true,
+    };
+  }
 
   if (guardError) {
     return { error: guardError };

@@ -712,6 +712,91 @@ export const executeTaskComplete = async (params, projectDir) => {
     }
   });
 
+  it("gsd_plan_milestone rejects a full slice with missing heavy fields via a behavioral round-trip", async () => {
+    // Behavioral guard for the full-vs-sketch conditional. The original
+    // regression (invisible "required unless isSketch" requirement) is
+    // surfaced to users through two distinct runtime channels:
+    //   1. A parse-time rejection when the tool is called with empty heavy
+    //      fields on a non-sketch slice (no isSketch=true).
+    //   2. An acceptance when isSketch=true + sketchScope is supplied and
+    //      heavy fields are omitted.
+    // Both arms are exercised below against the live handler — any schema
+    // refactor that preserves the user-observable contract (rejection +
+    // acceptance) passes, and any refactor that breaks the contract
+    // fails, regardless of whether internal `.describe()` prose changes.
+    const base = makeTmpBase();
+    try {
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const milestoneTool = server.tools.find((t) => t.name === "gsd_plan_milestone");
+      assert.ok(milestoneTool, "milestone planning tool should be registered");
+
+      // Arm 1: full slice (isSketch omitted) with the heavy fields missing
+      // must reject and name ALL four fields so the agent can self-correct.
+      let fullError: unknown;
+      try {
+        await milestoneTool!.handler({
+          projectDir: base,
+          milestoneId: "M001",
+          title: "Full slice path",
+          vision: "Behavioral test for isSketch conditional.",
+          slices: [
+            {
+              sliceId: "S01",
+              title: "Heavy slice",
+              risk: "medium",
+              depends: [],
+              demo: "Demo.",
+              goal: "Goal.",
+              // heavy fields intentionally omitted
+            },
+          ],
+        });
+      } catch (err) {
+        fullError = err;
+      }
+      assert.ok(fullError, "a non-sketch slice without heavy fields must reject");
+      const fullMsg = fullError instanceof Error ? fullError.message : String(fullError);
+      for (const field of ["successCriteria", "proofLevel", "integrationClosure", "observabilityImpact"]) {
+        assert.ok(
+          fullMsg.includes(field),
+          `rejection must name ${field} so agents can recover without a second round-trip; got: ${fullMsg}`,
+        );
+      }
+
+      // Arm 2: sketch slice (isSketch=true + sketchScope) with heavy fields
+      // omitted must be accepted — proving the conditional is live. Assert
+      // success directly rather than just checking a thrown message omits
+      // the heavy-field names: a generic failure would otherwise silently
+      // pass this arm.
+      const sketchResult = await milestoneTool!.handler({
+        projectDir: base,
+        milestoneId: "M002",
+        title: "Sketch slice path",
+        vision: "Behavioral test for isSketch conditional.",
+        slices: [
+          {
+            sliceId: "S01",
+            title: "Sketch slice",
+            risk: "medium",
+            depends: [],
+            demo: "Demo.",
+            goal: "Goal.",
+            isSketch: true,
+            sketchScope: "Two-sentence scope. Boundary defined.",
+          },
+        ],
+      });
+      assert.match(
+        (sketchResult as any).content[0].text as string,
+        /Planned milestone M002/,
+        "sketch slice with isSketch=true must be accepted by the handler",
+      );
+    } finally {
+      cleanup(base);
+    }
+  });
+
   it("gsd_plan_milestone requires sketchScope when isSketch=true and skips heavy fields", async () => {
     const base = makeTmpBase();
     try {
@@ -799,6 +884,32 @@ export const executeTaskComplete = async (params, projectDir) => {
         .get("Inline MCP requirement save regression") as Record<string, unknown> | undefined;
       assert.ok(row, "requirement should be written to the database");
       assert.equal(row["class"], "operability");
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_milestone_generate_id skips DB-only queued milestone rows", async () => {
+    const base = makeTmpBase();
+    try {
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_milestone_generate_id");
+      assert.ok(tool, "milestone ID tool should be registered");
+
+      const first = await tool!.handler({ projectDir: base });
+      assert.equal((first as any).content[0].text, "M001");
+      assert.ok(!existsSync(join(base, ".gsd", "milestones", "M001")), "ID generation should not create a milestone dir");
+
+      closeDatabase();
+
+      const second = await tool!.handler({ projectDir: base });
+      assert.equal((second as any).content[0].text, "M002");
+
+      const rows = _getAdapter()!
+        .prepare("SELECT id FROM milestones ORDER BY id")
+        .all() as Array<Record<string, unknown>>;
+      assert.deepEqual(rows.map((row) => row["id"]), ["M001", "M002"]);
     } finally {
       cleanup(base);
     }
@@ -1571,6 +1682,58 @@ describe("validateProjectDir", () => {
         process.env.GSD_WORKFLOW_PROJECT_ROOT = prevRoot;
       }
       cleanup(allowedRoot);
+    }
+  });
+
+  it("accepts a worktree under the allowed root external .gsd state target", () => {
+    const allowedRoot = makeTmpBase();
+    const externalState = makeTmpBase();
+    const worktree = join(externalState, "worktrees", "M001");
+    mkdirSync(worktree, { recursive: true });
+    rmSync(join(allowedRoot, ".gsd"), { recursive: true, force: true });
+    symlinkSync(externalState, join(allowedRoot, ".gsd"), "dir");
+
+    const prevRoot = process.env.GSD_WORKFLOW_PROJECT_ROOT;
+    try {
+      process.env.GSD_WORKFLOW_PROJECT_ROOT = allowedRoot;
+      const result = validateProjectDir(worktree);
+      assert.equal(result, realpathSync(worktree));
+    } finally {
+      if (prevRoot === undefined) {
+        delete process.env.GSD_WORKFLOW_PROJECT_ROOT;
+      } else {
+        process.env.GSD_WORKFLOW_PROJECT_ROOT = prevRoot;
+      }
+      cleanup(allowedRoot);
+      cleanup(externalState);
+    }
+  });
+
+  it("rejects external-state sibling paths that only share a prefix", () => {
+    const allowedRoot = makeTmpBase();
+    const externalState = makeTmpBase();
+    const sibling = `${externalState}-sibling`;
+    const siblingWorktree = join(sibling, "worktrees", "M001");
+    mkdirSync(siblingWorktree, { recursive: true });
+    rmSync(join(allowedRoot, ".gsd"), { recursive: true, force: true });
+    symlinkSync(externalState, join(allowedRoot, ".gsd"), "dir");
+
+    const prevRoot = process.env.GSD_WORKFLOW_PROJECT_ROOT;
+    try {
+      process.env.GSD_WORKFLOW_PROJECT_ROOT = allowedRoot;
+      assert.throws(
+        () => validateProjectDir(siblingWorktree),
+        /configured workflow project root/,
+      );
+    } finally {
+      if (prevRoot === undefined) {
+        delete process.env.GSD_WORKFLOW_PROJECT_ROOT;
+      } else {
+        process.env.GSD_WORKFLOW_PROJECT_ROOT = prevRoot;
+      }
+      cleanup(allowedRoot);
+      cleanup(externalState);
+      cleanup(sibling);
     }
   });
 

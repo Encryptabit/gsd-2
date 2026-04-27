@@ -5,14 +5,17 @@ import { getApiProvider } from "@gsd/pi-ai";
 import { AuthStorage, type AuthStorageData } from "./auth-storage.js";
 import { ModelRegistry } from "./model-registry.js";
 
-function createRegistry(hasAuthFn?: (provider: string) => boolean): ModelRegistry {
+function createRegistry(
+	hasAuthFn?: (provider: string) => boolean,
+	getApiKeyFn?: (provider: string) => Promise<string | undefined>,
+): ModelRegistry {
 	const authStorage = {
 		setFallbackResolver: () => {},
 		onCredentialChange: () => {},
 		getOAuthProviders: () => [],
 		get: () => undefined,
 		hasAuth: hasAuthFn ?? (() => false),
-		getApiKey: async () => undefined,
+		getApiKey: async (provider: string) => getApiKeyFn ? getApiKeyFn(provider) : undefined,
 	} as unknown as AuthStorage;
 
 	return new ModelRegistry(authStorage, "");
@@ -37,6 +40,10 @@ function createProviderModel(id: string, api?: string): NonNullable<Parameters<M
 
 function findModel(registry: ModelRegistry, provider: string, id: string): Model<Api> | undefined {
 	return registry.getAvailable().find((m) => m.provider === provider && m.id === id);
+}
+
+function availableModelIds(registry: ModelRegistry): Set<string> {
+	return new Set(registry.getAvailable().map((model) => `${model.provider}/${model.id}`));
 }
 
 function makeModel(provider: string, id: string, api: string): Model<Api> {
@@ -93,6 +100,22 @@ function createStreamSpy(): {
 // ─── Registration ─────────────────────────────────────────────────────────────
 
 describe("ModelRegistry authMode — registration", () => {
+	it("includes GPT-5.5 in the authenticated all-models menu backing list", () => {
+		const registry = createInMemoryRegistry({
+			openai: { type: "api_key", key: "sk-test" },
+			"openai-codex": {
+				type: "oauth",
+				access: "codex-access",
+				refresh: "codex-refresh",
+				expires: Date.now() + 60_000,
+			},
+		});
+
+		const ids = availableModelIds(registry);
+		assert.ok(ids.has("openai/gpt-5.5"), "all-models menu backing list should include openai/gpt-5.5");
+		assert.ok(ids.has("openai-codex/gpt-5.5"), "all-models menu backing list should include openai-codex/gpt-5.5");
+	});
+
 	it("registers externalCli provider with streamSimple and without apiKey/oauth", () => {
 		const registry = createRegistry();
 		const spy = createStreamSpy();
@@ -291,6 +314,12 @@ describe("ModelRegistry authMode — isProviderRequestReady", () => {
 		const registry = createRegistry(() => true);
 		assert.equal(registry.isProviderRequestReady("anthropic"), true);
 	});
+
+	it("returns false for denylisted providers even when auth exists", () => {
+		const registry = createRegistry(() => true);
+		registry.setDisabledModelProviders(["anthropic"]);
+		assert.equal(registry.isProviderRequestReady("anthropic"), false);
+	});
 });
 
 // ─── isReady callback ─────────────────────────────────────────────────────────
@@ -394,6 +423,17 @@ describe("ModelRegistry authMode — getAvailable", () => {
 		assert.equal(available.length, 0);
 	});
 
+	it("excludes denylisted providers from available models", () => {
+		const registry = createRegistry(() => true);
+		registry.setDisabledModelProviders(["google-gemini-cli"]);
+		const available = registry.getAvailable();
+		assert.equal(
+			available.some((m) => m.provider === "google-gemini-cli"),
+			false,
+			"google-gemini-cli models must be hidden when provider is denylisted",
+		);
+	});
+
 	it("prunes Codex models removed from ChatGPT-backed openai-codex OAuth", () => {
 		const registry = createInMemoryRegistry({
 			"openai-codex": {
@@ -460,6 +500,16 @@ describe("ModelRegistry authMode — getApiKey", () => {
 		const registry = createRegistry();
 		const key = await registry.getApiKeyForProvider("anthropic");
 		assert.equal(key, undefined);
+	});
+
+	it("still resolves provider keys for denylisted providers", async () => {
+		const registry = createRegistry(
+			() => true,
+			async (provider: string) => provider === "google-gemini-cli" ? "ya29.test-token" : undefined,
+		);
+		registry.setDisabledModelProviders(["google-gemini-cli"]);
+		const key = await registry.getApiKeyForProvider("google-gemini-cli");
+		assert.equal(key, "ya29.test-token");
 	});
 });
 

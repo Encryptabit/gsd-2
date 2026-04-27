@@ -1,5 +1,6 @@
+// GSD-2 Web — Boot route: records boot timestamp and cancels pending shutdown
 import { collectBootPayload, resolveProjectCwd } from "../../../../src/web/bridge-service.ts";
-import { cancelShutdown } from "../../../lib/shutdown-gate";
+import { cancelShutdown, recordBoot } from "../../../lib/shutdown-gate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -7,6 +8,7 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request): Promise<Response> {
   // A boot request proves the client is alive — cancel any pending shutdown
   // that was scheduled by pagehide during a page refresh.
+  recordBoot();
   cancelShutdown();
 
   const projectCwd = resolveProjectCwd(request);

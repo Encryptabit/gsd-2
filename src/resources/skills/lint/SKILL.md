@@ -7,6 +7,10 @@ description: Lint and format code. Auto-detects ESLint, Biome, Prettier, or lang
 Lint and format code in the current project. Auto-detect the project's linter and formatter toolchain, run them against the target files, and report results grouped by severity with actionable fix suggestions.
 </objective>
 
+<working_directory_awareness>
+**Before running any `git` or build command:** check whether your dispatch context specifies a working directory (look for "Working directory:" in your initial prompt). If it does and `pwd` does not match it, prefix every git invocation with `-C <that path>` (e.g. `git -C /path/to/worktree diff --name-only`) and run linters/formatters with the explicit path argument. Linting the wrong directory is a silent failure mode.
+</working_directory_awareness>
+
 <arguments>
 This skill accepts optional arguments after `/lint`:
 

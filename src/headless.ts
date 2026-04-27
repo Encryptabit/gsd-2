@@ -12,7 +12,7 @@
  *   11 — cancelled (SIGINT/SIGTERM received)
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolve } from 'node:path'
 import { ChildProcess } from 'node:child_process'
@@ -81,6 +81,24 @@ export interface HeadlessOptions {
   eventFilter?: Set<string>  // filter JSONL output to specific event types
   resumeSession?: string // session ID to resume (--resume <id>)
   bare?: boolean         // --bare: suppress CLAUDE.md/AGENTS.md, user skills, project preferences
+}
+
+/**
+ * Commands classified as multi-turn in headless mode: they involve multiple
+ * question rounds, codebase scanning, and artifact writing before the workflow
+ * completes (#3547). Multi-turn commands suppress single-execution-complete
+ * exit and disable the default 5-minute timeout.
+ *
+ * Exported so the regression test can exercise the real classifier rather
+ * than grepping the source for identifier names.
+ */
+export function isMultiTurnHeadlessCommand(command: string): boolean {
+  return (
+    command === 'auto' ||
+    command === 'next' ||
+    command === 'discuss' ||
+    command === 'plan'
+  )
 }
 
 interface TrackedEvent {
@@ -263,7 +281,7 @@ async function runHeadlessOnce(options: HeadlessOptions, restartCount: number): 
   const isAutoMode = options.command === 'auto'
   // discuss and plan are multi-turn: they involve multiple question rounds,
   // codebase scanning, and artifact writing before the workflow completes (#3547).
-  const isMultiTurnCommand = options.command === 'auto' || options.command === 'next' || options.command === 'discuss' || options.command === 'plan'
+  const isMultiTurnCommand = isMultiTurnHeadlessCommand(options.command)
   if (isAutoMode && options.timeout === 300_000) {
     options.timeout = 0
   }
@@ -332,6 +350,30 @@ async function runHeadlessOnce(options: HeadlessOptions, restartCount: number): 
     const { handleQuery } = await import('./headless-query.js')
     const result = await handleQuery(process.cwd())
     return { exitCode: result.exitCode, interrupted: false }
+  }
+
+  // Doctor: read-only health check, no RPC child needed (#4904 live-regression).
+  // The interactive `/gsd doctor` command lives in the GSD extension; this CLI
+  // path lets non-interactive callers (CI, recovery scripts, the live-regression
+  // suite) get the same diagnostic without a TTY.
+  if (options.command === 'doctor') {
+    const wantsJson = options.json || options.commandArgs.includes('--json')
+    const { runGSDDoctor } = await import('./resources/extensions/gsd/doctor.js')
+    const { formatDoctorReport, formatDoctorReportJson } = await import('./resources/extensions/gsd/doctor-format.js')
+    let exitCode = 1
+    try {
+      const report = await runGSDDoctor(process.cwd())
+      const out = wantsJson ? formatDoctorReportJson(report) : formatDoctorReport(report)
+      process.stdout.write(`${out}\n`)
+      exitCode = report.ok ? 0 : 1
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`[headless] doctor failed: ${msg}\n`)
+      exitCode = 1
+    }
+    // Bypass the auto-restart loop in runHeadless — doctor is a one-shot
+    // diagnostic; exit 1 means "issues detected", not "crashed".
+    process.exit(exitCode)
   }
 
   // Resolve CLI path for the child process
@@ -729,7 +771,14 @@ async function runHeadlessOnce(options: HeadlessOptions, restartCount: number): 
 
   // Signal handling
   const signalHandler = () => {
-    process.stderr.write('\n[headless] Interrupted, stopping child process...\n')
+    // Use writeSync on fd 2 to guarantee the Interrupted marker reaches
+    // consumers before process.exit() truncates pending async writes.
+    try {
+      writeSync(2, '\n[headless] Interrupted, stopping child process...\n')
+    } catch {
+      // Fallback to async write if fd 2 is somehow unavailable.
+      process.stderr.write('\n[headless] Interrupted, stopping child process...\n')
+    }
     interrupted = true
     exitCode = EXIT_CANCELLED
     // Kill child process — don't await, just fire and exit.
@@ -746,8 +795,20 @@ async function runHeadlessOnce(options: HeadlessOptions, restartCount: number): 
     }
     process.exit(exitCode)
   }
-  process.on('SIGINT', signalHandler)
-  process.on('SIGTERM', signalHandler)
+  // Use prependListener so our handler runs before pi-coding-agent's
+  // LSP-client module-load SIGINT handler, which calls process.exit(0)
+  // and would otherwise short-circuit our exit-code-11 contract.
+  process.prependListener('SIGINT', signalHandler)
+  process.prependListener('SIGTERM', signalHandler)
+  // Emit a deterministic readiness marker so test harnesses can wait for
+  // the SIGINT handler to be live before sending a signal. writeSync on
+  // fd 2 avoids any pipe-buffering race between the marker and subsequent
+  // signal delivery.
+  try {
+    writeSync(2, '[headless] signal-handlers-ready\n')
+  } catch {
+    process.stderr.write('[headless] signal-handlers-ready\n')
+  }
 
   // Start the RPC session
   try {

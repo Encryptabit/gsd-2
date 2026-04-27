@@ -1,9 +1,10 @@
+// GSD-2 Web — Session events SSE route: registers streams with shutdown gate
 import {
   collectCurrentProjectOnboardingState,
   getProjectBridgeServiceForCwd,
   requireProjectCwd,
 } from "../../../../../src/web/bridge-service.ts";
-import { cancelShutdown } from "../../../../lib/shutdown-gate";
+import { cancelShutdown, registerActiveStream } from "../../../../lib/shutdown-gate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,12 +40,15 @@ export async function GET(request: Request): Promise<Response> {
 
   let unsubscribe: (() => void) | null = null;
   let closed = false;
+  let deregisterFromGate: (() => void) | null = null;
 
   const closeWith = (controller: ReadableStreamDefaultController<Uint8Array>) => {
     if (closed) return;
     closed = true;
     unsubscribe?.();
     unsubscribe = null;
+    deregisterFromGate?.();
+    deregisterFromGate = null;
     controller.close();
   };
 
@@ -55,6 +59,21 @@ export async function GET(request: Request): Promise<Response> {
         controller.enqueue(encodeSseData(event));
       });
 
+      // Register with the shutdown gate so the gate can drain this stream
+      // before process.exit(). The gate calls our unsubscriber and sends
+      // a sentinel shutdown event so the client knows to stop expecting data.
+      deregisterFromGate = registerActiveStream(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ type: "shutdown" })}\n\n`),
+          );
+        } catch {
+          // stream may already be closing; ignore enqueue errors
+        }
+        closeWith(controller);
+      });
+
       request.signal.addEventListener("abort", () => closeWith(controller), { once: true });
     },
     cancel() {
@@ -62,6 +81,8 @@ export async function GET(request: Request): Promise<Response> {
       closed = true;
       unsubscribe?.();
       unsubscribe = null;
+      deregisterFromGate?.();
+      deregisterFromGate = null;
     },
   });
 
