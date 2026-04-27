@@ -514,6 +514,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
       "Use gsd_plan_slice for slice planning instead of writing S##-PLAN.md or task PLAN files directly.",
       "Keep parameters flat and provide the full slice planning payload, including tasks.",
       "The tool validates input, requires an existing parent slice, writes slice/task planning data, renders PLAN.md and task plan files from DB, and clears both state and parse caches after success.",
+      "Task inputs must be exact existing repo paths unless the same task or an earlier task lists that path in expectedOutput; missing input paths are rejected before DB writes.",
       "Use the canonical name gsd_plan_slice; gsd_slice_plan is only an alias.",
     ],
     parameters: Type.Object({

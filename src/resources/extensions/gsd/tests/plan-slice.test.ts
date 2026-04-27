@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { openDatabase, closeDatabase, insertMilestone, insertSlice, getSlice, getSliceTasks, getTask } from '../gsd-db.ts';
@@ -12,6 +12,14 @@ import { parseTaskPlanFile } from '../files.ts';
 function makeTmpBase(): string {
   const base = mkdtempSync(join(tmpdir(), 'gsd-plan-slice-'));
   mkdirSync(join(base, '.gsd', 'milestones', 'M001', 'slices', 'S02', 'tasks'), { recursive: true });
+  for (const inputPath of [
+    'src/resources/extensions/gsd/tools/plan-milestone.ts',
+    'src/resources/extensions/gsd/tools/plan-task.ts',
+  ]) {
+    const absolutePath = join(base, inputPath);
+    mkdirSync(dirname(absolutePath), { recursive: true });
+    writeFileSync(absolutePath, '// fixture\n', 'utf-8');
+  }
   return base;
 }
 
@@ -107,6 +115,60 @@ test('handlePlanSlice rejects invalid payloads', async () => {
     const result = await handlePlanSlice({ ...validParams(), tasks: [] }, base);
     assert.ok('error' in result);
     assert.match(result.error, /validation failed: tasks must be a non-empty array/);
+  } finally {
+    cleanup(base);
+  }
+});
+
+test('handlePlanSlice rejects task inputs that do not exist or come from planned outputs', async () => {
+  const base = makeTmpBase();
+  openDatabase(join(base, '.gsd', 'gsd.db'));
+
+  try {
+    seedParentSlice();
+    const params = validParams();
+    const result = await handlePlanSlice({
+      ...params,
+      tasks: [
+        params.tasks[0],
+        {
+          ...params.tasks[1],
+          inputs: ['src/resources/extensions/gsd/tools/missing-input.ts'],
+        },
+      ],
+    }, base);
+
+    assert.ok('error' in result);
+    assert.match(result.error, /planned task inputs reference missing files/);
+    assert.match(result.error, /Task T02 references 'src\/resources\/extensions\/gsd\/tools\/missing-input\.ts'/);
+    assert.equal(getSliceTasks('M001', 'S02').length, 0, 'invalid planning payload must not persist task rows');
+  } finally {
+    cleanup(base);
+  }
+});
+
+test('handlePlanSlice allows same-task planned outputs as inputs', async () => {
+  const base = makeTmpBase();
+  openDatabase(join(base, '.gsd', 'gsd.db'));
+
+  try {
+    seedParentSlice();
+    const params = validParams();
+    const generatedPath = 'src/resources/extensions/gsd/tools/generated-contract.ts';
+    const result = await handlePlanSlice({
+      ...params,
+      tasks: [
+        {
+          ...params.tasks[0],
+          inputs: [generatedPath],
+          expectedOutput: [generatedPath],
+        },
+        params.tasks[1],
+      ],
+    }, base);
+
+    assert.ok(!('error' in result), `unexpected error: ${'error' in result ? result.error : ''}`);
+    assert.equal(getTask('M001', 'S02', 'T01')?.inputs[0], generatedPath);
   } finally {
     cleanup(base);
   }

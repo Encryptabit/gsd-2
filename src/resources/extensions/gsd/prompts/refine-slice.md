@@ -54,9 +54,9 @@ Then:
 2. {{skillActivation}} Record the installed skills you expect executors to use in each task plan's `skills_used` frontmatter.
 3. Define slice-level verification — the objective stopping condition. Plan real test files with real assertions; for simple slices, executable commands are fine.
 4. For non-trivial slices, plan observability / proof level / integration closure, threat surface, and requirement impact. Omit entirely for simple slices.
-5. Decompose the slice into tasks that fit one context window each. Every task must have Why / Files / Do / Verify / Done-when, plus a task plan with description, steps, must-haves, verification, inputs (backtick-wrapped paths), and expected output (backtick-wrapped paths).
+5. Decompose the slice into tasks that fit one context window each. Every task must have Why / Files / Do / Verify / Done-when, plus a task plan with description, steps, must-haves, verification, inputs (backtick-wrapped paths), and expected output (backtick-wrapped paths). Existing Inputs must be exact paths that exist in the current repo; verify them with `rg`, `find`, or targeted file reads before calling `gsd_plan_slice`. If an input will be created by this task or an earlier task, list that same exact path in that task's Expected Output.
 6. **Persist planning state through `gsd_plan_slice`.** Call it with the full payload. The tool writes to the DB and renders `{{outputPath}}` and `{{slicePath}}/tasks/T##-PLAN.md` automatically. Do NOT rely on direct `PLAN.md` writes.
-7. **Self-audit the plan.** If every task were completed exactly as written, the slice goal/demo should actually be true. Every must-have maps to at least one task. Inputs and Expected Output are backtick-wrapped file paths.
+7. **Self-audit the plan.** If every task were completed exactly as written, the slice goal/demo should actually be true. Every must-have maps to at least one task. Inputs and Expected Output are backtick-wrapped file paths. Every Inputs path either exists on disk now or is listed as an Expected Output of the same task or an earlier task; `gsd_plan_slice` rejects missing input paths.
 8. If refinement produced structural decisions that diverge from the sketch, append them to `.gsd/DECISIONS.md`.
 9. {{commitInstruction}}
 
