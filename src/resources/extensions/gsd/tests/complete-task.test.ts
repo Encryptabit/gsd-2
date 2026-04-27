@@ -403,16 +403,17 @@ console.log('\n=== complete-task: handler idempotency ===');
   const tasks = getSliceTasks('M001', 'S01');
   assertEq(tasks.length, 1, 'should have exactly 1 task row after first call');
 
-  // Second call with same params — state machine guard rejects (task is already complete)
+  // Second call with same params — task is already complete, handler is idempotent
   const r2 = await handleCompleteTask(params, basePath);
-  assertTrue('error' in r2, 'second call should return error (task already complete)');
-  if ('error' in r2) {
-    assertMatch(r2.error, /already complete/, 'error should mention already complete');
+  assertTrue(!('error' in r2), 'second call should succeed (idempotent)');
+  if (!('error' in r2)) {
+    assertTrue(r2.alreadyComplete === true, 'second call should report alreadyComplete=true');
+    assertEq(r2.taskId, params.taskId, 'second call should echo taskId');
   }
 
-  // Still only 1 task row (no duplication from rejected second call)
+  // Still only 1 task row (no duplication from idempotent second call)
   const tasksAfter = getSliceTasks('M001', 'S01');
-  assertEq(tasksAfter.length, 1, 'should still have exactly 1 task row after rejected second call');
+  assertEq(tasksAfter.length, 1, 'should still have exactly 1 task row after idempotent second call');
 
   cleanupDir(basePath);
   cleanup(dbPath);

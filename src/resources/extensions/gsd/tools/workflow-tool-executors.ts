@@ -200,14 +200,23 @@ export async function executeTaskComplete(
       isError: true,
       };
     }
+    const alreadyComplete = result.alreadyComplete === true;
     return {
-      content: [{ type: "text", text: `Completed task ${result.taskId} (${result.sliceId}/${result.milestoneId})` }],
+      content: [
+        {
+          type: "text",
+          text: alreadyComplete
+            ? `Task ${result.taskId} already complete (${result.sliceId}/${result.milestoneId})`
+            : `Completed task ${result.taskId} (${result.sliceId}/${result.milestoneId})`,
+        },
+      ],
       details: {
         operation: "complete_task",
         taskId: result.taskId,
         sliceId: result.sliceId,
         milestoneId: result.milestoneId,
         summaryPath: result.summaryPath,
+        alreadyComplete,
       },
     };
   } catch (err) {

@@ -475,7 +475,7 @@ describe("state-machine-live-validation", () => {
       assert.match((result as any).error, /closed slice/);
     });
 
-    test("double task completion returns error (H5-related)", async () => {
+    test("double task completion is idempotent (H5-related)", async () => {
       base = createFullFixture();
       openDatabase(join(base, ".gsd", "gsd.db"));
       insertMilestone({ id: "M001", title: "Active", status: "active" });
@@ -483,8 +483,8 @@ describe("state-machine-live-validation", () => {
       insertTask({ id: "T01", sliceId: "S01", milestoneId: "M001", status: "complete" });
 
       const result = await handleCompleteTask(makeTaskParams("T01", "S01", "M001") as any, base);
-      assert.ok("error" in result);
-      assert.match((result as any).error, /already complete/);
+      assert.ok(!("error" in result), "second completion should be idempotent, not an error");
+      assert.equal((result as any).alreadyComplete, true);
     });
 
     test("cannot complete slice with zero tasks — vacuous truth guard", async () => {

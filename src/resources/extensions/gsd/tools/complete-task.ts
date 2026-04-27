@@ -45,6 +45,7 @@ export interface CompleteTaskResult {
   sliceId: string;
   milestoneId: string;
   summaryPath: string;
+  alreadyComplete?: boolean;
 }
 
 import type { TaskRow } from "../gsd-db.js";
@@ -121,6 +122,27 @@ function paramsToTaskRow(params: CompleteTaskParams, completedAt: string): TaskR
   };
 }
 
+function resolveTaskSummaryPath(
+  basePath: string,
+  milestoneId: string,
+  sliceId: string,
+  taskId: string,
+): string {
+  const tasksDir = resolveTasksDir(basePath, milestoneId, sliceId);
+  if (tasksDir) {
+    return join(tasksDir, `${taskId}-SUMMARY.md`);
+  }
+
+  const gsdDir = join(basePath, ".gsd");
+  const manualTasksDir = join(gsdDir, "milestones", milestoneId, "slices", sliceId, "tasks");
+  mkdirSync(manualTasksDir, { recursive: true });
+  return join(manualTasksDir, `${taskId}-SUMMARY.md`);
+}
+
+function isCompletedStatus(status: string): boolean {
+  return status === "complete" || status === "done";
+}
+
 /**
  * Handle the complete_task operation end-to-end.
  *
@@ -159,6 +181,8 @@ export async function handleCompleteTask(
   // ── Guards + DB writes inside a single transaction (prevents TOCTOU) ───
   const completedAt = new Date().toISOString();
   let guardError: string | null = null;
+  let alreadyComplete = false;
+  let summaryPath = "";
 
   // ── ADR-011 Phase 2: validate escalation payload BEFORE any side effects ─
   // Building the artifact runs the full shape validation (2-4 options, unique
@@ -210,8 +234,13 @@ export async function handleCompleteTask(
     }
 
     const existingTask = getTask(params.milestoneId, params.sliceId, params.taskId);
+    if (existingTask && isCompletedStatus(existingTask.status)) {
+      alreadyComplete = true;
+      return;
+    }
+
     if (existingTask && isClosedStatus(existingTask.status)) {
-      guardError = `task ${params.taskId} is already complete — use gsd_task_reopen first if you need to redo it`;
+      guardError = `task ${params.taskId} is ${existingTask.status} — use gsd_task_reopen first if you need to complete it`;
       return;
     }
 
@@ -252,6 +281,17 @@ export async function handleCompleteTask(
     return { error: guardError };
   }
 
+  if (alreadyComplete) {
+    summaryPath = resolveTaskSummaryPath(basePath, params.milestoneId, params.sliceId, params.taskId);
+    return {
+      taskId: params.taskId,
+      sliceId: params.sliceId,
+      milestoneId: params.milestoneId,
+      summaryPath,
+      alreadyComplete: true,
+    };
+  }
+
   // ── Filesystem operations (outside transaction) ─────────────────────────
   // If disk render fails, roll back the DB status so deriveState() and
   // verifyExpectedArtifact() stay consistent (both say "not done").
@@ -261,17 +301,7 @@ export async function handleCompleteTask(
   const summaryMd = renderSummaryContent(taskRow, params.sliceId, params.milestoneId, params.verificationEvidence ?? []);
 
   // Resolve and write summary to disk
-  let summaryPath: string;
-  const tasksDir = resolveTasksDir(basePath, params.milestoneId, params.sliceId);
-  if (tasksDir) {
-    summaryPath = join(tasksDir, `${params.taskId}-SUMMARY.md`);
-  } else {
-    // Tasks dir doesn't exist on disk yet — build path manually and ensure dirs
-    const gsdDir = join(basePath, ".gsd");
-    const manualTasksDir = join(gsdDir, "milestones", params.milestoneId, "slices", params.sliceId, "tasks");
-    mkdirSync(manualTasksDir, { recursive: true });
-    summaryPath = join(manualTasksDir, `${params.taskId}-SUMMARY.md`);
-  }
+  summaryPath = resolveTaskSummaryPath(basePath, params.milestoneId, params.sliceId, params.taskId);
 
   try {
     await saveFile(summaryPath, summaryMd);
