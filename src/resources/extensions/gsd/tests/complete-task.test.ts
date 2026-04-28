@@ -499,5 +499,155 @@ console.log('\n=== complete-task: minimal params (no keyFiles, keyDecisions, ver
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// complete-task: post-merge precedence — stale → idempotent → reopen-error
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The guard block in handleCompleteTask checks (in order):
+//   1. milestone closed?              → error
+//   2. slice closed?                  → error
+//   3. existing task closed AND stale → __stale_duplicate__ (no-op success)
+//   4. existing task is "complete"    → alreadyComplete: true (idempotent)
+//   5. existing task is otherwise closed (e.g. "skipped") → error pointing
+//      the caller at gsd_task_reopen
+//
+// The stale branch must short-circuit BEFORE the idempotent branch — a
+// stale turn should never trigger the "already complete" success response,
+// because the idempotent contract was added for re-issued tool calls from
+// the SAME turn, not orphan writes from superseded turns. These tests pin
+// that ordering so it can't drift.
+
+import { runWithTurnGeneration, bumpTurnGeneration, _resetTurnEpoch } from '../auto/turn-epoch.ts';
+
+console.log('\n=== complete-task: post-merge precedence — non-stale + status "complete" → alreadyComplete ===');
+{
+  const dbPath = tempDbPath();
+  openDatabase(dbPath);
+  const { basePath } = createTempProject();
+
+  insertMilestone({ id: 'M001', title: 'Test Milestone' });
+  insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Test Slice' });
+  insertTask({
+    id: 'T01',
+    sliceId: 'S01',
+    milestoneId: 'M001',
+    title: 'T01',
+    status: 'complete',
+    oneLiner: 'done',
+    narrative: 'already done',
+    verificationResult: 'ok',
+    duration: '0',
+    blockerDiscovered: false,
+    deviations: 'None',
+    knownIssues: 'None',
+    keyFiles: [],
+    keyDecisions: [],
+  });
+
+  const result = await handleCompleteTask(makeValidParams(), basePath);
+
+  assertTrue(!('error' in result), 'non-stale completion of an already-complete task is idempotent, not an error');
+  if (!('error' in result)) {
+    assertEq(result.alreadyComplete, true, 'should return alreadyComplete: true');
+    assertTrue(!('duplicate' in result) || result.duplicate !== true, 'must NOT set duplicate (that branch is for stale turns only)');
+    assertTrue(!('stale' in result) || result.stale !== true, 'must NOT set stale (that branch is for stale turns only)');
+  }
+
+  cleanupDir(basePath);
+  cleanup(dbPath);
+}
+
+console.log('\n=== complete-task: post-merge precedence — non-stale + status "skipped" → reopen-error ===');
+{
+  const dbPath = tempDbPath();
+  openDatabase(dbPath);
+  const { basePath } = createTempProject();
+
+  insertMilestone({ id: 'M001', title: 'Test Milestone' });
+  insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Test Slice' });
+  insertTask({
+    id: 'T01',
+    sliceId: 'S01',
+    milestoneId: 'M001',
+    title: 'T01',
+    status: 'skipped',
+    oneLiner: 'skipped',
+    narrative: 'user skipped',
+    verificationResult: '',
+    duration: '0',
+    blockerDiscovered: false,
+    deviations: 'None',
+    knownIssues: 'None',
+    keyFiles: [],
+    keyDecisions: [],
+  });
+
+  const result = await handleCompleteTask(makeValidParams(), basePath);
+
+  assertTrue('error' in result, 'completing a skipped task is an error — user opt-out is explicit');
+  if ('error' in result) {
+    assertMatch(result.error, /use gsd_task_reopen/, 'error must point the caller at gsd_task_reopen');
+    assertMatch(result.error, /skipped/, 'error must name the offending status');
+  }
+
+  cleanupDir(basePath);
+  cleanup(dbPath);
+}
+
+console.log('\n=== complete-task: post-merge precedence — stale + any closed status → duplicate+stale (NOT alreadyComplete) ===');
+{
+  const dbPath = tempDbPath();
+  openDatabase(dbPath);
+  const { basePath } = createTempProject();
+  _resetTurnEpoch();
+
+  insertMilestone({ id: 'M001', title: 'Test Milestone' });
+  insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Test Slice' });
+  insertTask({
+    id: 'T01',
+    sliceId: 'S01',
+    milestoneId: 'M001',
+    title: 'T01',
+    status: 'complete', // closed; idempotent path would normally fire
+    oneLiner: 'done',
+    narrative: 'already done',
+    verificationResult: 'ok',
+    duration: '0',
+    blockerDiscovered: false,
+    deviations: 'None',
+    knownIssues: 'None',
+    keyFiles: [],
+    keyDecisions: [],
+  });
+
+  // Capture the current turn generation, then bump it BEFORE invoking the
+  // handler under that captured context. The handler's call to
+  // isStaleWrite("complete-task") sees captured < current → stale.
+  const capturedGen = 0;
+  bumpTurnGeneration('precedence-test: simulate superseded turn');
+
+  const result = await runWithTurnGeneration(capturedGen, async () => {
+    return await handleCompleteTask(makeValidParams(), basePath);
+  });
+
+  assertTrue(!('error' in result), 'stale duplicate must NOT return an error');
+  if (!('error' in result)) {
+    assertEq(result.duplicate, true, 'stale path must return duplicate: true');
+    assertEq(result.stale, true, 'stale path must return stale: true');
+    assertTrue(
+      !('alreadyComplete' in result) || result.alreadyComplete !== true,
+      'stale path must NOT set alreadyComplete — the stale branch fires before the idempotent branch',
+    );
+    // resolveTaskSummaryPath was called with create:false on the stale path,
+    // so the synthesized path is returned but the directory was not created
+    // on disk. We only assert the path looks right.
+    assertMatch(result.summaryPath, /T01-SUMMARY\.md$/, 'stale path returns a summary path even though no file is written');
+  }
+
+  _resetTurnEpoch();
+  cleanupDir(basePath);
+  cleanup(dbPath);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 report();

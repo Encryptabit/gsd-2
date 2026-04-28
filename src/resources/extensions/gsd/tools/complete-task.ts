@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 
 import type { CompleteTaskParams } from "../types.js";
-import { isClosedStatus } from "../status-guards.js";
+import { isClosedStatus, isCompletedStatus } from "../status-guards.js";
 import {
   transaction,
   insertMilestone,
@@ -135,25 +135,32 @@ function paramsToTaskRow(params: CompleteTaskParams, completedAt: string): TaskR
   };
 }
 
+/**
+ * Resolve the on-disk path for a task's SUMMARY.md.
+ *
+ * @param create  When true (default) and the milestone/slice tasks/ dir
+ *   does not yet exist, mkdir it so a subsequent saveFile call succeeds.
+ *   Pass `false` for read-only paths (stale-write fallback) — the caller
+ *   only needs the path to return in the response, not to write to it.
+ */
 function resolveTaskSummaryPath(
   basePath: string,
   milestoneId: string,
   sliceId: string,
   taskId: string,
+  options: { create?: boolean } = {},
 ): string {
+  const create = options.create ?? true;
   const tasksDir = resolveTasksDir(basePath, milestoneId, sliceId);
   if (tasksDir) {
     return join(tasksDir, `${taskId}-SUMMARY.md`);
   }
 
-  const gsdDir = join(basePath, ".gsd");
-  const manualTasksDir = join(gsdDir, "milestones", milestoneId, "slices", sliceId, "tasks");
-  mkdirSync(manualTasksDir, { recursive: true });
+  const manualTasksDir = join(basePath, ".gsd", "milestones", milestoneId, "slices", sliceId, "tasks");
+  if (create) {
+    mkdirSync(manualTasksDir, { recursive: true });
+  }
   return join(manualTasksDir, `${taskId}-SUMMARY.md`);
-}
-
-function isCompletedStatus(status: string): boolean {
-  return status === "complete" || status === "done";
 }
 
 /**
@@ -302,20 +309,16 @@ export async function handleCompleteTask(
     // Orphaned-turn duplicate: the task is already complete from the
     // superseded turn's earlier (real) call. Return a non-mutating success
     // so the stale LLM tool call unwinds cleanly. summaryPath is synthesized
-    // from the existing on-disk layout; no file is written.
-    const tasksDir = resolveTasksDir(basePath, params.milestoneId, params.sliceId);
-    const staleSummaryPath = tasksDir
-      ? join(tasksDir, `${params.taskId}-SUMMARY.md`)
-      : join(
-          basePath,
-          ".gsd",
-          "milestones",
-          params.milestoneId,
-          "slices",
-          params.sliceId,
-          "tasks",
-          `${params.taskId}-SUMMARY.md`,
-        );
+    // from the existing on-disk layout; no file is written, and `create:
+    // false` keeps this read-only — we don't want a stale turn creating
+    // empty tasks/ directories on disk.
+    const staleSummaryPath = resolveTaskSummaryPath(
+      basePath,
+      params.milestoneId,
+      params.sliceId,
+      params.taskId,
+      { create: false },
+    );
     return {
       taskId: params.taskId,
       sliceId: params.sliceId,
