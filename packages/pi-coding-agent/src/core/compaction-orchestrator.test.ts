@@ -57,6 +57,7 @@ function createHarness(overrides?: {
 	cancelResult?: boolean;
 	willRetry?: boolean;
 	hasQueuedMessages?: boolean;
+	keepRecentTokens?: number;
 }) {
 	const dir = mkdtempSync(join(tmpdir(), "compaction-orchestrator-test-"));
 	const sessionManager = SessionManager.create(dir, dir);
@@ -93,7 +94,7 @@ function createHarness(overrides?: {
 			getCompactionSettings: () => ({
 				enabled: true,
 				reserveTokens: 16_384,
-				keepRecentTokens: 1,
+				keepRecentTokens: overrides?.keepRecentTokens ?? 1,
 			}),
 		} as any,
 		modelRegistry: {
@@ -126,7 +127,7 @@ describe("CompactionOrchestrator", () => {
 		const harness = createHarness({ willRetry: true });
 		t.after(harness.cleanup);
 
-		await (harness.orchestrator as any)._runAutoCompaction("overflow", true);
+		await (harness.orchestrator as any)._runAutoCompaction("overflow", true, 200_000);
 		await wait(150);
 
 		const endEvent = harness.emittedEvents.find((event) => event.type === "auto_compaction_end");
@@ -141,7 +142,7 @@ describe("CompactionOrchestrator", () => {
 		const harness = createHarness({ willRetry: false, hasQueuedMessages: false });
 		t.after(harness.cleanup);
 
-		await (harness.orchestrator as any)._runAutoCompaction("threshold", false);
+		await (harness.orchestrator as any)._runAutoCompaction("threshold", false, 180_000);
 		await wait(150);
 
 		const endEvent = harness.emittedEvents.find((event) => event.type === "auto_compaction_end");
@@ -150,5 +151,40 @@ describe("CompactionOrchestrator", () => {
 		assert.equal(endEvent?.willRetry, false, "threshold cancel should stay non-retrying");
 		assert.equal(harness.continueFn.mock.callCount(), 0, "threshold cancel should not resume the agent without queued work");
 		assert.equal(harness.replaceMessages.mock.callCount(), 0, "non-retry cancel should not trim messages");
+	});
+
+	// Regression: reportedTokens previously came from preparation.tokensBefore (a message-history
+	// estimate) and was 0 when prepareCompaction returned undefined — exactly the overhead-dominated
+	// case the diagnostic exists to surface. Issue #4665.
+	it("diagnostic reports caller-supplied contextTokens even when preparation bails (overhead-dominated)", async (t) => {
+		const harness = createHarness({ keepRecentTokens: 1_000_000 });
+		t.after(harness.cleanup);
+
+		const reportedTokens = 195_000;
+		await (harness.orchestrator as any)._runAutoCompaction("threshold", false, reportedTokens);
+		await wait(50);
+
+		const diagnostic = harness.emittedEvents.find((event) => event.type === "auto_compaction_diagnostic");
+		assert.ok(diagnostic, "should emit auto_compaction_diagnostic");
+		assert.equal(diagnostic?.reportedTokens, reportedTokens, "reportedTokens should reflect the LLM-reported whole-request size, not preparation.tokensBefore");
+		assert.equal(typeof diagnostic?.messageTokens, "number", "messageTokens should be present");
+		assert.ok((diagnostic?.messageTokens as number) < reportedTokens, "in the overhead-dominated case messageTokens is much smaller than reportedTokens");
+		assert.equal(diagnostic?.willProceed, false, "willProceed should be false when preparation bails (nothing older than keepRecentTokens to cut)");
+		assert.equal(diagnostic?.messagesToSummarizeCount, 0);
+		assert.equal(diagnostic?.turnPrefixMessagesCount, 0);
+	});
+
+	it("diagnostic reports caller-supplied contextTokens when preparation proceeds", async (t) => {
+		const harness = createHarness({ keepRecentTokens: 1 });
+		t.after(harness.cleanup);
+
+		const reportedTokens = 175_000;
+		await (harness.orchestrator as any)._runAutoCompaction("threshold", false, reportedTokens);
+		await wait(50);
+
+		const diagnostic = harness.emittedEvents.find((event) => event.type === "auto_compaction_diagnostic");
+		assert.ok(diagnostic, "should emit auto_compaction_diagnostic");
+		assert.equal(diagnostic?.reportedTokens, reportedTokens, "reportedTokens should pass through unchanged on the proceed path");
+		assert.equal(diagnostic?.willProceed, true);
 	});
 });

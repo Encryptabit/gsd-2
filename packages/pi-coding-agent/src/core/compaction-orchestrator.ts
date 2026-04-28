@@ -244,11 +244,12 @@ export class CompactionOrchestrator {
 			}
 
 			this._overflowRecoveryAttempted = true;
+			const overflowReportedTokens = calculateContextTokens(assistantMessage.usage);
 			const messages = this._deps.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this._deps.agent.replaceMessages(messages.slice(0, -1));
 			}
-			await this._runAutoCompaction("overflow", true);
+			await this._runAutoCompaction("overflow", true, overflowReportedTokens);
 			return;
 		}
 
@@ -277,7 +278,7 @@ export class CompactionOrchestrator {
 		const compactableTokens = this._estimateMessageTokens();
 
 		if (shouldCompact(contextTokens, contextWindow, settings, compactableTokens)) {
-			await this._runAutoCompaction("threshold", false);
+			await this._runAutoCompaction("threshold", false, contextTokens);
 		}
 	}
 
@@ -304,7 +305,11 @@ export class CompactionOrchestrator {
 	// Private helpers
 	// =========================================================================
 
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<void> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		reportedTokens: number,
+	): Promise<void> {
 		const settings = this._deps.settingsManager.getCompactionSettings();
 
 		this._deps.emit({ type: "auto_compaction_start", reason });
@@ -330,7 +335,7 @@ export class CompactionOrchestrator {
 			const messageTokens = this._estimateMessageTokens();
 			this._deps.emit({
 				type: "auto_compaction_diagnostic",
-				reportedTokens: preparation?.tokensBefore ?? 0,
+				reportedTokens,
 				messageTokens,
 				messagesToSummarizeCount: preparation?.messagesToSummarize.length ?? 0,
 				turnPrefixMessagesCount: preparation?.turnPrefixMessages.length ?? 0,
