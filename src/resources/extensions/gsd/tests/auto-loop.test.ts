@@ -1,6 +1,6 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1586,6 +1586,154 @@ test("autoLoop multi-handler before_next_dispatch: first pause/retry wins, later
     "handlers run in order and stop after the first pause/retry",
   );
   assert.ok(deps.callLog.includes("pauseAuto"), "pause result should drive deps.pauseAuto");
+});
+
+test("autoLoop hook-retry sidecar restart-resume: persisted retry dispatches on first iteration", async (t) => {
+  // Simulate a process restart by writing a valid hook-retry sidecar file
+  // directly to disk before autoLoop starts. The loop should detect the
+  // file at iter 1's top, hydrate s.sidecarQueue from it, and dispatch
+  // the persisted retry instead of the freshly-derived unit.
+  _resetPendingResolve();
+  clearHookEmitter();
+  t.after(() => clearHookEmitter());
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+  const basePath = mkdtempSync(join(tmpdir(), "gsd-hook-resume-"));
+  t.after(() => rmSync(basePath, { recursive: true, force: true }));
+
+  // Hand-write the persisted sidecar file as if a previous process had
+  // saved it before crashing. Schema must match what
+  // savePersistedHookRetrySidecars writes (schemaVersion: 1).
+  const runtimeDir = join(basePath, ".gsd", "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  const sidecarsPath = join(runtimeDir, "hook-retry-sidecars.json");
+  const persistedPrompt = "RESUMED: previous process owed this remediation";
+  writeFileSync(
+    sidecarsPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      queue: [{
+        kind: "retry",
+        unitType: "execute-task",
+        unitId: "M001/S01/T01",
+        prompt: persistedPrompt,
+      }],
+    }),
+  );
+
+  const dispatchedPrompts: string[] = [];
+  pi.sendMessage = (...args: unknown[]) => {
+    const payload = args[0] as { content?: unknown } | undefined;
+    dispatchedPrompts.push(String(payload?.content ?? ""));
+    pi.calls.push(args);
+  };
+
+  const s = makeLoopSession({ basePath });
+  // Hook returns nothing — first iteration completes cleanly so the loop
+  // exits after the sidecar drains.
+  setHookEmitter({
+    emitExtensionEvent: async () => undefined,
+  } as any);
+
+  const journalEvents: Array<{ type: string; data?: Record<string, unknown> }> = [];
+  const deps = makeMockDeps({
+    emitJournalEvent: (entry: any) => {
+      journalEvents.push({ type: entry.eventType, data: entry.data });
+    },
+    postUnitPostVerification: async () => {
+      // Stop after the persisted retry runs.
+      s.active = false;
+      return "continue" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+  await loopPromise;
+
+  assert.equal(dispatchedPrompts.length, 1, "exactly one dispatch on the resumed iteration");
+  assert.equal(
+    dispatchedPrompts[0],
+    persistedPrompt,
+    "first dispatch must be the persisted retry prompt, not a fresh dispatch",
+  );
+  const resumeEvents = journalEvents.filter((e) => e.type === "sidecar-retry-resume");
+  assert.equal(resumeEvents.length, 1, "should journal exactly one sidecar-retry-resume");
+  assert.equal(resumeEvents[0]?.data?.count, 1, "resume event records the queue size");
+  // After the iteration completes without a retry request, the file should
+  // be cleared so a subsequent restart doesn't re-dispatch the same unit.
+  assert.equal(existsSync(sidecarsPath), false, "persisted sidecar file should be cleared after successful drain");
+});
+
+test("autoLoop hook-retry sidecar: schemaVersion mismatch drops the queue and clears the file", async (t) => {
+  // A stale or hand-edited sidecar file with the wrong schemaVersion must
+  // not be replayed — load drops it and clears the file so a future
+  // savePersistedHookRetrySidecars writes a fresh, current-version payload.
+  _resetPendingResolve();
+  clearHookEmitter();
+  t.after(() => clearHookEmitter());
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+  const basePath = mkdtempSync(join(tmpdir(), "gsd-hook-schema-"));
+  t.after(() => rmSync(basePath, { recursive: true, force: true }));
+
+  const runtimeDir = join(basePath, ".gsd", "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  const sidecarsPath = join(runtimeDir, "hook-retry-sidecars.json");
+  writeFileSync(
+    sidecarsPath,
+    JSON.stringify({
+      schemaVersion: 999,
+      queue: [{
+        kind: "retry",
+        unitType: "execute-task",
+        unitId: "M001/S01/T01",
+        prompt: "should never dispatch",
+      }],
+    }),
+  );
+
+  const dispatchedPrompts: string[] = [];
+  pi.sendMessage = (...args: unknown[]) => {
+    const payload = args[0] as { content?: unknown } | undefined;
+    dispatchedPrompts.push(String(payload?.content ?? ""));
+    pi.calls.push(args);
+  };
+
+  const s = makeLoopSession({ basePath });
+  setHookEmitter({ emitExtensionEvent: async () => undefined } as any);
+
+  const deps = makeMockDeps({
+    postUnitPostVerification: async () => {
+      s.active = false;
+      return "continue" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+  await loopPromise;
+
+  assert.equal(dispatchedPrompts.length, 1, "loop should still dispatch — but via the normal derive/dispatch path");
+  assert.notEqual(
+    dispatchedPrompts[0],
+    "should never dispatch",
+    "stale-schema sidecar prompt must NOT be dispatched",
+  );
+  assert.equal(
+    existsSync(sidecarsPath),
+    false,
+    "stale-schema file should be cleared so the next save writes a current payload",
+  );
 });
 
 test("autoLoop exits when no active milestone found", async (t) => {

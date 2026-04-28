@@ -108,14 +108,46 @@ function isPersistedRetrySidecar(value: unknown): value is SidecarItem {
   );
 }
 
+/**
+ * On-disk schema version for hook-retry-sidecars.json. Bump when the file
+ * shape changes incompatibly. `loadPersistedHookRetrySidecars` drops any
+ * payload whose `schemaVersion` does not match this constant.
+ */
+const HOOK_RETRY_SIDECAR_SCHEMA_VERSION = 1;
+
 function loadPersistedHookRetrySidecars(basePath: string): SidecarItem[] {
+  let raw: string;
   try {
-    const payload = JSON.parse(readFileSync(hookRetrySidecarsPath(basePath), "utf-8"));
-    const queue = Array.isArray(payload?.queue) ? payload.queue : [];
-    return queue.filter(isPersistedRetrySidecar);
-  } catch {
+    raw = readFileSync(hookRetrySidecarsPath(basePath), "utf-8");
+  } catch (err) {
+    const code = err && typeof err === "object" && "code" in err ? (err as { code?: string }).code : undefined;
+    if (code !== "ENOENT") {
+      debugLog("autoLoop", { phase: "load-hook-retries-read-failed", error: err instanceof Error ? err.message : String(err) });
+    }
     return [];
   }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch (err) {
+    logWarning("engine", `hook-retry sidecar dropped: malformed JSON (${err instanceof Error ? err.message : String(err)})`);
+    clearPersistedHookRetrySidecars(basePath);
+    return [];
+  }
+
+  const version = (payload as { schemaVersion?: unknown } | null)?.schemaVersion;
+  if (version !== HOOK_RETRY_SIDECAR_SCHEMA_VERSION) {
+    logWarning(
+      "engine",
+      `hook-retry sidecar dropped: schemaVersion ${String(version)} does not match expected ${HOOK_RETRY_SIDECAR_SCHEMA_VERSION}`,
+    );
+    clearPersistedHookRetrySidecars(basePath);
+    return [];
+  }
+
+  const queue = Array.isArray((payload as { queue?: unknown }).queue) ? (payload as { queue: unknown[] }).queue : [];
+  return queue.filter(isPersistedRetrySidecar);
 }
 
 function savePersistedHookRetrySidecars(basePath: string, queue: SidecarItem[]): void {
@@ -127,10 +159,14 @@ function savePersistedHookRetrySidecars(basePath: string, queue: SidecarItem[]):
 
   const filePath = hookRetrySidecarsPath(basePath);
   mkdirSync(join(gsdRoot(basePath), "runtime"), { recursive: true });
-  writeFileSync(
+  // atomicWriteSync writes to a tmp path then rename()s — a crash mid-write
+  // leaves either the previous file intact or the new one fully written,
+  // never a half-truncated payload that loadPersistedHookRetrySidecars
+  // would have to reject.
+  atomicWriteSync(
     filePath,
     JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: HOOK_RETRY_SIDECAR_SCHEMA_VERSION,
       updatedAt: new Date().toISOString(),
       queue: retries,
     }, null, 2) + "\n",
@@ -140,8 +176,15 @@ function savePersistedHookRetrySidecars(basePath: string, queue: SidecarItem[]):
 function clearPersistedHookRetrySidecars(basePath: string): void {
   try {
     unlinkSync(hookRetrySidecarsPath(basePath));
-  } catch {
-    // Missing or already removed is fine.
+  } catch (err) {
+    // Missing file is the common case (clear-after-success). Anything else
+    // (EACCES, EBUSY) is a real disk problem worth surfacing in debug logs
+    // — silently swallowing them masked permission failures during the
+    // audit that produced this PR.
+    const code = err && typeof err === "object" && "code" in err ? (err as { code?: string }).code : undefined;
+    if (code !== "ENOENT") {
+      debugLog("autoLoop", { phase: "clear-hook-retries-failed", error: err instanceof Error ? err.message : String(err) });
+    }
   }
 }
 
