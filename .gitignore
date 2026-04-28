@@ -27,6 +27,7 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+.serena/
 *.code-workspace
 .env
 .env.*
