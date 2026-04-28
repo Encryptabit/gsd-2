@@ -432,7 +432,8 @@ export function findCutPoint(
 // Summarization
 // ============================================================================
 
-const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+/** @internal Exported for the prompt-drift sentinel test in compaction.test.ts. */
+export const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
 
@@ -591,16 +592,21 @@ export function isDegenerateSummary(summary: string | undefined): boolean {
 	// certainly degenerate for a multi-chunk pipeline.
 	if (summary.trim().length < 100) return true;
 
-	// Layer 3: structural density. The SUMMARIZATION_PROMPT template has 7
-	// sections. When the LLM returns a template shell with mostly "(none)"
-	// bodies, substring matches may miss it but the shell is still empty. If
-	// we see ≥4 "(none)" placeholders (≥57% of the 7 sections) AND total
-	// length is under 1200 chars, flag as degenerate. The threshold is 4 and
-	// not 3 because a narrow real task can legitimately leave three sections
-	// as "(none)" (e.g., Constraints, Blocked, Critical Context) while the
-	// other four carry real content.
+	// Layer 3: structural density. When the LLM returns a template shell with
+	// mostly "(none)" bodies, substring matches may miss it but the shell is
+	// still empty. The previous absolute threshold (≥4 "(none)") was hand-tuned
+	// for the 6-section SUMMARIZATION_PROMPT and would have to be re-tuned by
+	// hand any time the prompt grew or shrank. Use a relative threshold
+	// against the section count actually present in the summary itself
+	// (`^## ` headers, top-level only — `###` subsections under Progress are
+	// not counted as their own sections). Flag when ≥55% of sections resolve
+	// to "(none)" AND total length is under 1200 chars. 55% is just above
+	// 3/6 = 50% so a narrow real task with three legit "(none)" sections
+	// (Constraints, Blocked, Critical Context) while the other three carry
+	// real content does not trip the guard.
 	const noneCount = (summary.match(/\(none\)/gi) ?? []).length;
-	if (noneCount >= 4 && summary.trim().length < 1200) return true;
+	const sectionCount = (summary.match(/^## /gm) ?? []).length;
+	if (sectionCount > 0 && noneCount / sectionCount >= 0.55 && summary.trim().length < 1200) return true;
 
 	return false;
 }

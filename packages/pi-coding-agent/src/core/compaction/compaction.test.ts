@@ -12,6 +12,7 @@ import type { Model, AssistantMessage } from "@gsd/pi-ai";
 import type { SessionEntry } from "../session-manager.js";
 import {
 	CompactionProducedNoSummaryError,
+	SUMMARIZATION_PROMPT,
 	chunkMessages,
 	estimateTokens,
 	generateSummary,
@@ -496,6 +497,64 @@ describe("(#4665) degenerate summary guard", () => {
 			isDegenerateSummary(densityShell),
 			true,
 			"shells with ≥3 '(none)' sections under the length threshold must flag via the density guard",
+		);
+	});
+
+	it("SUMMARIZATION_PROMPT section count is the value isDegenerateSummary's relative threshold was tuned for", () => {
+		// Sentinel for the density guard. The relative threshold (≥55% of
+		// sections resolving to "(none)") was chosen against the prompt as it
+		// stands today: 6 top-level sections (Goal, Constraints, Progress,
+		// Key Decisions, Next Steps, Critical Context). If a future prompt
+		// edit adds or removes top-level sections, this assertion fires —
+		// not because the prompt change is wrong, but to force whoever's
+		// editing it to also revisit the density-guard threshold and the
+		// densityShell / narrowButReal fixtures in this file.
+		const topLevelSections = (SUMMARIZATION_PROMPT.match(/^## /gm) ?? []).length;
+		assert.equal(
+			topLevelSections,
+			6,
+			`SUMMARIZATION_PROMPT has ${topLevelSections} top-level sections; ` +
+			`re-validate isDegenerateSummary's 0.55 threshold and densityShell/narrowButReal fixtures, then update this assertion.`,
+		);
+	});
+
+	it("isDegenerateSummary density guard scales with section count (relative threshold, not hardcoded 4)", () => {
+		// Five-section shell, every body "(none)". The OLD absolute threshold
+		// `noneCount >= 4` would have flagged 4-of-5 (80%) and not flagged
+		// 3-of-5 (60%). The NEW relative threshold (≥55%) flags 3-of-5
+		// because 3/5 = 0.6 ≥ 0.55. Pin the relative behaviour so a future
+		// prompt change that shrinks/grows the section count doesn't silently
+		// over- or under-flag.
+		const fiveSectionShell = `## Section A
+real content here just enough to keep us under the 1200 char length budget but well over the 100 char floor.
+
+## Section B
+- (none)
+
+## Section C
+- (none)
+
+## Section D
+- (none)
+
+## Section E
+more real content also here, again with enough body to clear the substring-guard floor and stay below the absolute length cutoff.`;
+		assert.equal(
+			isDegenerateSummary(fiveSectionShell),
+			true,
+			"3 of 5 sections (none) = 0.6 ≥ 0.55 threshold → degenerate",
+		);
+
+		// Same shape but with one more populated section drops the ratio to
+		// 3/6 = 0.5, below the 0.55 threshold → must NOT flag.
+		const sixSectionShellWithThreeNone = fiveSectionShell + `
+
+## Section F
+yet more populated body content to satisfy the per-section narrative bar.`;
+		assert.equal(
+			isDegenerateSummary(sixSectionShellWithThreeNone),
+			false,
+			"3 of 6 sections (none) = 0.5 < 0.55 threshold → NOT degenerate (matches narrowButReal precedent)",
 		);
 	});
 
