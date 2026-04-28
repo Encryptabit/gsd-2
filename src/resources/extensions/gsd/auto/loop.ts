@@ -85,6 +85,14 @@ function saveStuckState(basePath: string, state: LoopState): void {
   }
 }
 
+/**
+ * Maximum consecutive `before_next_dispatch` retry attempts per unit. After
+ * this is exhausted the loop journals `hook-retry-budget-exhausted` and
+ * proceeds (treating the iteration as completed) so a misbehaving extension
+ * cannot wedge auto-mode against MAX_LOOP_ITERATIONS.
+ */
+const MAX_HOOK_RETRIES = 3;
+
 function hookRetrySidecarsPath(basePath: string): string {
   return join(gsdRoot(basePath), "runtime", "hook-retry-sidecars.json");
 }
@@ -812,36 +820,90 @@ export async function autoLoop(
         break;
       }
 
+      const hookRetryKey = `${iterData.unitType}/${iterData.unitId}`;
       if (hookResult?.action === "retry") {
-        const retrySidecar: SidecarItem = {
-          kind: "retry",
-          unitType: iterData.unitType,
-          unitId: iterData.unitId,
-          prompt: buildHookRetryPrompt(iterData, hookResult.reason),
-        };
-        s.sidecarQueue.unshift(retrySidecar);
-        savePersistedHookRetrySidecars(s.basePath, s.sidecarQueue);
-        deps.emitJournalEvent({
-          ts: new Date().toISOString(),
-          flowId,
-          seq: nextSeq(),
-          eventType: "iteration-end",
-          data: {
+        const priorAttempts = s.hookRetryCount.get(hookRetryKey) ?? 0;
+        const nextAttempts = priorAttempts + 1;
+        if (nextAttempts > MAX_HOOK_RETRIES) {
+          // Cap exhausted — drop the retry, clear any persisted sidecar so a
+          // restart doesn't re-arm the same loop, journal the budget event,
+          // and fall through to the success path so the loop advances.
+          s.hookRetryCount.delete(hookRetryKey);
+          if (sidecarItem?.kind === "retry") {
+            clearPersistedHookRetrySidecars(s.basePath);
+          }
+          deps.emitJournalEvent({
+            ts: new Date().toISOString(),
+            flowId,
+            seq: nextSeq(),
+            eventType: "hook-retry-budget-exhausted",
+            data: {
+              iteration,
+              unitType: iterData.unitType,
+              unitId: iterData.unitId,
+              attempts: priorAttempts,
+              limit: MAX_HOOK_RETRIES,
+              reason: hookResult.reason,
+            },
+          });
+          debugLog("autoLoop", {
+            phase: "hook-retry-budget-exhausted",
             iteration,
-            hookRetry: true,
+            unitType: iterData.unitType,
+            unitId: iterData.unitId,
+            attempts: priorAttempts,
+            limit: MAX_HOOK_RETRIES,
+          });
+          ctx.ui.notify(
+            `before_next_dispatch retry budget (${MAX_HOOK_RETRIES}) exhausted for ${iterData.unitType} ${iterData.unitId} — proceeding.`,
+            "warning",
+          );
+          // Fall through to success path below.
+        } else {
+          s.hookRetryCount.set(hookRetryKey, nextAttempts);
+          const retrySidecar: SidecarItem = {
+            kind: "retry",
+            unitType: iterData.unitType,
+            unitId: iterData.unitId,
+            prompt: buildHookRetryPrompt(iterData, hookResult.reason),
+          };
+          s.sidecarQueue.unshift(retrySidecar);
+          savePersistedHookRetrySidecars(s.basePath, s.sidecarQueue);
+          deps.emitJournalEvent({
+            ts: new Date().toISOString(),
+            flowId,
+            seq: nextSeq(),
+            eventType: "iteration-end",
+            data: {
+              iteration,
+              hookRetry: true,
+              attempts: nextAttempts,
+              limit: MAX_HOOK_RETRIES,
+              reason: hookResult.reason,
+              retryUnitType: iterData.unitType,
+              retryUnitId: iterData.unitId,
+            },
+          });
+          debugLog("autoLoop", {
+            phase: "hook-retry",
+            iteration,
+            attempts: nextAttempts,
+            limit: MAX_HOOK_RETRIES,
             reason: hookResult.reason,
-            retryUnitType: iterData.unitType,
-            retryUnitId: iterData.unitId,
-          },
-        });
-        debugLog("autoLoop", { phase: "hook-retry", iteration, reason: hookResult.reason });
-        finishTurn("retry");
-        continue;
+          });
+          finishTurn("retry");
+          continue;
+        }
       }
 
       if (sidecarItem?.kind === "retry") {
         clearPersistedHookRetrySidecars(s.basePath);
       }
+
+      // Iteration completed without a retry request — reset this unit's hook
+      // retry counter so a future intermittent failure on the same unit gets
+      // a full budget rather than the leftover from a prior streak.
+      s.hookRetryCount.delete(hookRetryKey);
 
       consecutiveErrors = 0; // Iteration completed successfully
       consecutiveCooldowns = 0;

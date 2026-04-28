@@ -758,6 +758,7 @@ function makeLoopSession(overrides?: Partial<Record<string, unknown>>) {
     unitLifetimeDispatches: new Map<string, number>(),
     unitRecoveryCount: new Map<string, number>(),
     verificationRetryCount: new Map<string, number>(),
+    hookRetryCount: new Map<string, number>(),
     gitService: null,
     lastRequestTimestamp: 0,
     autoStartTime: Date.now(),
@@ -1460,6 +1461,131 @@ test("autoLoop remediates same unit when before_next_dispatch requests retry", a
   assert.match(prompts[1] ?? "", /review-blocked: fix the rejected state before continuing/);
   assert.match(prompts[1] ?? "", /do the thing/);
   assert.equal(existsSync(retrySidecarsPath), false, "retry sidecar should clear after remediation completes");
+});
+
+test("autoLoop hook-retry budget exhausts after MAX_HOOK_RETRIES and proceeds", async (t) => {
+  // A misbehaving extension that always returns { action: "retry" } would
+  // pin auto-mode on the same unit until MAX_LOOP_ITERATIONS, burning the
+  // budget. The cap (MAX_HOOK_RETRIES = 3) lets retries happen for
+  // legitimate reasons but stops infinite loops; once exhausted the loop
+  // journals "hook-retry-budget-exhausted" and treats the iteration as
+  // complete so dispatch can advance.
+  _resetPendingResolve();
+  clearHookEmitter();
+  t.after(() => clearHookEmitter());
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+  const basePath = mkdtempSync("/tmp/gsd-hook-budget-");
+  t.after(() => rmSync(basePath, { recursive: true, force: true }));
+
+  const s = makeLoopSession({ basePath });
+  let hookCallCount = 0;
+  setHookEmitter({
+    emitExtensionEvent: async (event: any) => {
+      if (event?.type !== "before_next_dispatch") return undefined;
+      hookCallCount++;
+      // The 4th call is the one that exhausts (nextAttempts = 4 > MAX_HOOK_RETRIES = 3).
+      // Stop the loop here so the test does not race past exhaust into a fresh
+      // dispatch cycle (the counter resets on completed iterations).
+      if (hookCallCount >= 4) s.active = false;
+      return { action: "retry", reason: `relentless retry #${hookCallCount}` };
+    },
+  } as any);
+
+  const journalEvents: Array<{ type: string; data?: Record<string, unknown> }> = [];
+  const deps = makeMockDeps({
+    emitJournalEvent: (entry: any) => {
+      journalEvents.push({ type: entry.eventType, data: entry.data });
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+
+  // Drive 4 iterations: original + 3 retries. The 4th hook call exhausts
+  // the budget and sets s.active=false; loop top exits on the next check.
+  for (let i = 0; i < 4; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (!s.active) break;
+    resolveAgentEnd(makeEvent());
+  }
+
+  await loopPromise;
+
+  assert.equal(hookCallCount, 4, `hook should fire 4 times (1 original + 3 retries before exhaust); got ${hookCallCount}`);
+  const exhaustEvents = journalEvents.filter((e) => e.type === "hook-retry-budget-exhausted");
+  assert.equal(exhaustEvents.length, 1, "exactly one hook-retry-budget-exhausted journal event");
+  assert.equal(exhaustEvents[0]?.data?.limit, 3, "exhaust event records the cap");
+  assert.equal(exhaustEvents[0]?.data?.attempts, 3, "exhaust event records the attempts at the time of exhaust");
+  assert.equal(s.active, false, "loop should exit after the cap-exhaust iteration completes");
+  assert.equal(s.hookRetryCount.size, 0, "hookRetryCount should be reset after exhaust");
+});
+
+test("autoLoop multi-handler before_next_dispatch: first pause/retry wins, later handlers do not run", async (t) => {
+  // Documents the runner contract: handlers run in registration order, and
+  // the first handler returning a pause/retry result short-circuits the
+  // chain. A "continue" / undefined result is treated as "no opinion".
+  _resetPendingResolve();
+  clearHookEmitter();
+  t.after(() => clearHookEmitter());
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+  const basePath = mkdtempSync("/tmp/gsd-hook-multi-");
+  t.after(() => rmSync(basePath, { recursive: true, force: true }));
+
+  const s = makeLoopSession({ basePath });
+
+  // Simulate a real multi-handler chain by walking it inside emitExtensionEvent
+  // (the gsd hook-emitter delegates to pi-coding-agent's runner, which is the
+  // component under test for ordering semantics).
+  const callOrder: string[] = [];
+  const handlers: Array<() => { action?: string; reason?: string } | undefined> = [
+    () => { callOrder.push("h1-continue"); return { action: "continue" }; },
+    () => { callOrder.push("h2-undefined"); return undefined; },
+    () => { callOrder.push("h3-pause"); return { action: "pause", reason: "h3 says stop" }; },
+    () => { callOrder.push("h4-retry"); return { action: "retry", reason: "should never run" }; },
+  ];
+
+  setHookEmitter({
+    emitExtensionEvent: async (event: any) => {
+      if (event?.type !== "before_next_dispatch") return undefined;
+      // Mirror runner.invokeHandlers semantics: first non-undefined
+      // pause|retry wins; continue|undefined is "keep going".
+      for (const h of handlers) {
+        const r = h();
+        if (!r) continue;
+        if (r.action === "pause" || r.action === "retry") {
+          return { action: r.action, reason: r.reason };
+        }
+      }
+      return undefined;
+    },
+  } as any);
+
+  const deps = makeMockDeps({
+    pauseAuto: async () => {
+      deps.callLog.push("pauseAuto");
+      s.active = false;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+  await loopPromise;
+
+  assert.deepEqual(
+    callOrder,
+    ["h1-continue", "h2-undefined", "h3-pause"],
+    "handlers run in order and stop after the first pause/retry",
+  );
+  assert.ok(deps.callLog.includes("pauseAuto"), "pause result should drive deps.pauseAuto");
 });
 
 test("autoLoop exits when no active milestone found", async (t) => {

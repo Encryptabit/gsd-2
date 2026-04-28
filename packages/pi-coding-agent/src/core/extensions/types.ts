@@ -752,17 +752,39 @@ export interface UnitEndEvent {
 	cwd: string;
 }
 
-/** Fired after a unit completes and finalize passes, before the next dispatch. */
+/**
+ * Fired after a unit completes and finalize passes, before the next dispatch.
+ *
+ * The host (gsd-2 auto-loop) currently only reaches this point on a successful
+ * unit completion — failed/cancelled/blocked outcomes break out of the
+ * iteration before this hook is emitted. The status union is therefore
+ * narrowed to `"completed"` to match the only call site.
+ *
+ * TODO(events): widen this union when failed/cancelled/blocked emit sites
+ * land. When you do, also widen the dispatch in extensions/runner.ts and
+ * audit existing handlers — they may have assumed `status === "completed"`.
+ */
 export interface BeforeNextDispatchEvent {
 	type: "before_next_dispatch";
 	unitType: string;
 	unitId: string;
 	milestoneId?: string;
-	status: "completed" | "failed" | "cancelled" | "blocked";
+	status: "completed";
 	cwd: string;
 }
 
-/** Result from before_next_dispatch event handler. */
+/**
+ * Result from a `before_next_dispatch` handler.
+ *
+ * Handlers run in registration order; the first handler that returns a
+ * non-`undefined` result with `action === "pause"` or `action === "retry"`
+ * wins, and later handlers do not run. Returning `undefined`, omitting the
+ * `action` field, or returning `{ action: "continue" }` is equivalent to
+ * "no opinion" — the runner moves on to the next handler, and if no
+ * handler short-circuits the loop proceeds to the next iteration normally.
+ *
+ * `reason` is surfaced in journal entries and pause/retry notifications.
+ */
 export interface BeforeNextDispatchEventResult {
 	action?: "pause" | "continue" | "retry";
 	reason?: string;
@@ -1349,6 +1371,13 @@ export interface ExtensionAPI {
 	on(event: "milestone_end", handler: ExtensionHandler<MilestoneEndEvent>): void;
 	on(event: "unit_start", handler: ExtensionHandler<UnitStartEvent>): void;
 	on(event: "unit_end", handler: ExtensionHandler<UnitEndEvent>): void;
+	/**
+	 * Fired between `runFinalize` and the next `runPreDispatch` iteration
+	 * once the just-finished unit's status is known. Handlers run in
+	 * registration order and the first non-`undefined` `pause`/`retry`
+	 * result short-circuits the rest; `continue`/`undefined` is "no opinion".
+	 * See `BeforeNextDispatchEventResult` for the precise contract.
+	 */
 	on(event: "before_next_dispatch", handler: ExtensionHandler<BeforeNextDispatchEvent, BeforeNextDispatchEventResult>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;

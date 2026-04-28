@@ -192,7 +192,9 @@ export async function emitBeforeNextDispatch(args: {
   unitType: string;
   unitId: string;
   milestoneId?: string;
-  status: "completed" | "failed" | "cancelled" | "blocked";
+  // Narrowed to match BeforeNextDispatchEvent.status. See TODO(events) there
+  // before adding "failed" / "cancelled" / "blocked".
+  status: "completed";
   cwd: string;
 }): Promise<BeforeNextDispatchEventResult | undefined> {
   if (!_pi) return undefined;

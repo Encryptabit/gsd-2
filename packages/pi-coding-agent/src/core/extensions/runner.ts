@@ -1184,6 +1184,16 @@ export class ExtensionRunner {
 		);
 	}
 
+	/**
+	 * Emit `before_next_dispatch` to all registered handlers in registration
+	 * order. The first handler that returns `{ action: "pause" | "retry" }`
+	 * short-circuits the chain — later handlers are NOT invoked, and that
+	 * handler's `{ action, reason }` is returned to the caller. Returning
+	 * `undefined`, omitting the `action` field, or returning
+	 * `{ action: "continue" }` is treated as "no opinion" and the runner
+	 * moves on. If no handler short-circuits, this returns `undefined` and
+	 * the host is expected to proceed with the next iteration normally.
+	 */
 	async emitBeforeNextDispatch(
 		event: Omit<BeforeNextDispatchEvent, "type">,
 	): Promise<BeforeNextDispatchEventResult | undefined> {

@@ -138,6 +138,10 @@ export class AutoSession {
   pendingCrashRecovery: string | null = null;
   pendingVerificationRetry: PendingVerificationRetry | null = null;
   readonly verificationRetryCount = new Map<string, number>();
+  /** Tracks consecutive `before_next_dispatch` retry hook attempts per unit
+   *  (key: `${unitType}/${unitId}`). Capped by MAX_HOOK_RETRIES in auto/loop.ts
+   *  so a misbehaving hook can't wedge auto-mode against MAX_LOOP_ITERATIONS. */
+  readonly hookRetryCount = new Map<string, number>();
   pausedSessionFile: string | null = null;
   pausedUnitType: string | null = null;
   pausedUnitId: string | null = null;
@@ -281,6 +285,7 @@ export class AutoSession {
     this.pendingCrashRecovery = null;
     this.pendingVerificationRetry = null;
     this.verificationRetryCount.clear();
+    this.hookRetryCount.clear();
     this.pausedSessionFile = null;
     this.pausedUnitType = null;
     this.pausedUnitId = null;

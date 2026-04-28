@@ -45,6 +45,7 @@ export type JournalEventType =
   | "stuck-detected"
   | "sidecar-dequeue"
   | "sidecar-retry-resume"
+  | "hook-retry-budget-exhausted"
   | "iteration-end"
   | "worktree-enter"
   | "worktree-create-failed"
