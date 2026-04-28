@@ -21,6 +21,16 @@ import { resolve } from "node:path";
 import type { TaskRow } from "./gsd-db.ts";
 import type { PreExecutionCheckJSON } from "./verification-evidence.ts";
 
+/**
+ * Narrow input shape for path/ordering checks. The full TaskRow carries DB
+ * bookkeeping (timestamps, completion narrative, etc.) that the input checks
+ * never read. Callers that already have a TaskRow can pass it directly
+ * (TaskRow is structurally a superset). Callers that don't (e.g. plan-slice
+ * validating a brand-new plan against disk) can build just these four fields
+ * instead of synthesising fake DB rows with empty narratives.
+ */
+export type TaskInputCheckable = Pick<TaskRow, "id" | "status" | "inputs" | "expected_output">;
+
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 
 // ─── Result Types ────────────────────────────────────────────────────────────
@@ -412,7 +422,7 @@ function containsGlobPattern(candidate: string): boolean {
  * run and its outputs are available regardless of sequence position or disk state (#4071).
  * All paths are normalized for consistent comparison.
  */
-function getExpectedOutputsUpTo(tasks: TaskRow[], taskIndex: number): Set<string> {
+function getExpectedOutputsUpTo(tasks: TaskInputCheckable[], taskIndex: number): Set<string> {
   const outputs = new Set<string>();
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
@@ -440,7 +450,7 @@ function getExpectedOutputsUpTo(tasks: TaskRow[], taskIndex: number): Set<string
  * All paths are normalized before comparison to ensure ./src/a.ts matches src/a.ts.
  */
 export function checkFilePathConsistency(
-  tasks: TaskRow[],
+  tasks: TaskInputCheckable[],
   basePath: string
 ): PreExecutionCheckJSON[] {
   const results: PreExecutionCheckJSON[] = [];

@@ -22,6 +22,7 @@ import {
   runPreExecutionChecks,
   normalizeFilePath,
   type PreExecutionResult,
+  type TaskInputCheckable,
 } from "../pre-execution-checks.ts";
 import type { TaskRow } from "../gsd-db.ts";
 
@@ -284,6 +285,45 @@ describe("checkFilePathConsistency", () => {
 
       const results = checkFilePathConsistency(tasks, tempDir);
       assert.deepEqual(results, []);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // Regression: planning-side callers (plan-slice.ts) build TaskInputCheckable
+  // objects directly instead of synthesising fake TaskRow values with empty
+  // narratives. Asserts that the narrow Pick type — id / status / inputs /
+  // expected_output only — is sufficient to drive checkFilePathConsistency.
+  // If someone re-widens the parameter to TaskRow[], this fails to compile.
+  test("accepts narrow TaskInputCheckable input from planning-side callers", () => {
+    tempDir = join(tmpdir(), `pre-exec-test-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, "src.ts"), "");
+
+    try {
+      const tasks: TaskInputCheckable[] = [
+        {
+          id: "T01",
+          status: "pending",
+          inputs: ["src.ts"],
+          expected_output: ["out/result.json"],
+        },
+        {
+          id: "T02",
+          status: "pending",
+          inputs: ["out/result.json", "missing.ts"],
+          expected_output: [],
+        },
+      ];
+
+      const results = checkFilePathConsistency(tasks, tempDir);
+      // T01 inputs satisfied (src.ts on disk).
+      // T02 inputs: out/result.json is in T01's expected_output (prior task), passes.
+      // T02 inputs: missing.ts neither exists nor is produced — should fail.
+      const failures = results.filter((r) => !r.passed);
+      assert.equal(failures.length, 1, "exactly one missing-input failure");
+      assert.equal(failures[0]?.target, "missing.ts");
+      assert.equal(failures[0]?.blocking, true);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

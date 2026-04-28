@@ -10,7 +10,6 @@ import {
   upsertTaskPlanning,
   insertGateRow,
   updateSliceStatus,
-  type TaskRow,
 } from "../gsd-db.js";
 import type { GateId } from "../types.js";
 import { invalidateStateCache } from "../state.js";
@@ -19,7 +18,7 @@ import { renderAllProjections } from "../workflow-projections.js";
 import { writeManifest } from "../workflow-manifest.js";
 import { appendEvent } from "../workflow-events.js";
 import { logWarning } from "../workflow-logger.js";
-import { checkFilePathConsistency } from "../pre-execution-checks.js";
+import { checkFilePathConsistency, type TaskInputCheckable } from "../pre-execution-checks.js";
 
 export interface PlanSliceTaskInput {
   taskId: string;
@@ -131,43 +130,17 @@ function validateParams(params: PlanSliceParams): PlanSliceParams {
   };
 }
 
-function toPreExecutionTaskRows(params: PlanSliceParams): TaskRow[] {
-  return params.tasks.map((task, index) => ({
-    milestone_id: params.milestoneId,
-    slice_id: params.sliceId,
+function toInputCheckables(params: PlanSliceParams): TaskInputCheckable[] {
+  return params.tasks.map((task) => ({
     id: task.taskId,
-    title: task.title,
     status: "pending",
-    one_liner: "",
-    narrative: "",
-    verification_result: "",
-    duration: "",
-    completed_at: null,
-    blocker_discovered: false,
-    deviations: "",
-    known_issues: "",
-    key_files: [],
-    key_decisions: [],
-    full_summary_md: "",
-    description: task.description,
-    estimate: task.estimate,
-    files: task.files,
-    verify: task.verify,
     inputs: task.inputs,
     expected_output: task.expectedOutput,
-    observability_impact: task.observabilityImpact ?? "",
-    full_plan_md: task.fullPlanMd ?? "",
-    sequence: index,
-    blocker_source: "",
-    escalation_pending: 0,
-    escalation_awaiting_review: 0,
-    escalation_artifact_path: null,
-    escalation_override_applied_at: null,
   }));
 }
 
 function validatePlannedInputPaths(params: PlanSliceParams, basePath: string): string | null {
-  const checks = checkFilePathConsistency(toPreExecutionTaskRows(params), basePath);
+  const checks = checkFilePathConsistency(toInputCheckables(params), basePath);
   const blockingFailures = checks.filter((check) => !check.passed && check.blocking);
   if (blockingFailures.length === 0) return null;
 
